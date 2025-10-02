@@ -3,7 +3,7 @@ import os
 from tqdm import tqdm, trange
 import argparse
 
-from scripts.tools import complete_ratings, compute_rmse
+from scripts.tools import complete_ratings
 
 
 if __name__ == '__main__':
