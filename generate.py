@@ -6,13 +6,18 @@ import argparse
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Generate a completed ratings table.')
-    parser.add_argument("--name", type=str, default="ratings_eval.npy",
-                      help="Name of the npy of the ratings table to complete")
+
+    parser = argparse.ArgumentParser(
+        description='Generate a completed ratings table.'
+        )
+    parser.add_argument(
+        "--name",
+        type=str,
+        default="ratings_eval.npy",
+        help="Name of the npy of the ratings table to complete"
+        )
 
     args = parser.parse_args()
-
-
 
     # Open Ratings table
     print('Ratings loading...') 
@@ -24,10 +29,5 @@ if __name__ == '__main__':
     average = np.nanmean(table)
     table = np.nan_to_num(table, nan=average)
 
-    
-
     # Save the completed table 
     np.save("output.npy", table) ## DO NOT CHANGE THIS LINE
-
-
-        
