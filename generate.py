@@ -39,7 +39,7 @@ if __name__ == '__main__':
     params = {
         "n_factors": 180,
         "n_iters": 52,
-        "reg": 7.0,
+        "reg": 8.0,
         "random_state": 42
     }
 
