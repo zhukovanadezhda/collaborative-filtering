@@ -49,12 +49,12 @@ if __name__ == '__main__':
         test_path="data/ratings_test.npy",
         genres_path="data/genres.npy",
         params=params,
-        merge=False
+        merge=True
         )
     
-    # Print the RMSE on the test set
-    R_test = np.load("data/ratings_test.npy")
-    print(f"RMSE on the test set: {compute_rmse(R_test, table):.4f}")
+    # # Print the RMSE on the test set
+    # R_test = np.load("data/ratings_test.npy")
+    # print(f"RMSE on the test set: {compute_rmse(R_test, table):.4f}")
 
     # Save the completed table 
     np.save("output.npy", table) ## DO NOT CHANGE THIS LINE
