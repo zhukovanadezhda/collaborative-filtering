@@ -36,11 +36,22 @@ if __name__ == '__main__':
     # }
     
     # Best parameters for the model with genres (found with Optuna)
+    # params = {
+    #     "n_factors": 180,
+    #     "n_iters": 52,
+    #     "reg": 8.0,
+    #     "random_state": 42
+    # }
+
+    # Best parameters for the laplacian graph regularization
     params = {
-        "n_factors": 180,
-        "n_iters": 52,
-        "reg": 8.0,
-        "random_state": 42
+        "n_factors": 50,
+        "n_iters": 20,
+        "reg": 0.8,
+        "random_state": 42,
+        "S_topk": 10,
+        "S_eps": 1e-5,
+        "alpha": 0.7,
     }
 
     # Complete the ratings table
@@ -49,8 +60,9 @@ if __name__ == '__main__':
         test_path="data/ratings_test.npy",
         genres_path="data/genres.npy",
         params=params,
-        merge=True
-        )
+        merge=True,
+        use_laplacian=True,
+    )
     
     # # Print the RMSE on the test set
     # R_test = np.load("data/ratings_test.npy")
