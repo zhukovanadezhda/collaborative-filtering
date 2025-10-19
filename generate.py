@@ -3,7 +3,7 @@ import os
 from tqdm import tqdm, trange
 import argparse
 
-from scripts.tools import complete_ratings
+from scripts.als_tools import complete_ratings, compute_rmse
 
 
 if __name__ == '__main__':
@@ -26,19 +26,47 @@ if __name__ == '__main__':
     print('Ratings Loaded.')
     
     # Define the parameters
+    
+    # Best parameters for the model without genres (found with Optuna)
+    # params = {
+    #     "n_factors": 99,
+    #     "n_iters": 41,
+    #     "reg": 0.795,
+    #     "random_state": 42
+    # }
+    
+    # Best parameters for the model with genres (found with Optuna)
     params = {
-        "n_factors": 99,
-        "n_iters": 41,
-        "reg": 0.795,
+        "n_factors": 180, 
+        "n_iters": 52,
+        "reg": 8.0,
         "random_state": 42
     }
+
+    # Best parameters for the laplacian graph regularization
+    # params = {
+    #     "n_factors": 50,
+    #     "n_iters": 20,
+    #     "reg": 0.8,
+    #     "random_state": 42,
+    #     "S_topk": 10,
+    #     "S_eps": 1e-5,
+    #     "alpha": 0.7,
+    # }
 
     # Complete the ratings table
     table = complete_ratings(
         train_path="data/ratings_train.npy",
         test_path="data/ratings_test.npy",
-        params=params
-        )
+        genres_path="data/genres.npy",
+        params=params,
+        merge=True,
+        use_laplacian=False,
+    )
+    
+    # # Print the RMSE on the test set
+    # R_test = np.load("data/ratings_test.npy")
+    # print(f"RMSE on the test set: {compute_rmse(R_test, table):.4f}")
 
     # Save the completed table 
     np.save("output.npy", table) ## DO NOT CHANGE THIS LINE
