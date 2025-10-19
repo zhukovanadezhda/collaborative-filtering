@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Alternating Least Squares (ALS) for collaborative filtering.
 
@@ -7,17 +6,18 @@ missing ratings.
 """
 
 from __future__ import annotations
-
 import logging
-from typing import Dict
-
+from typing import Dict, Tuple, Any
 import numpy as np
+from scipy.linalg import cho_factor, cho_solve
 from tqdm import trange
 
 from scripts.laplacian_tools import build_item_similarity_from_genres
 
 # Scale factor for random initialization of latent factors
 SCALE_FACTOR = 0.1
+# Small epsilon for numerical stability (to ensure SPD matrices)
+EPS_SPD = 1e-10
 
 # Set up logging
 logging.basicConfig(
@@ -27,57 +27,233 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _cholesky_solve(A: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Solve Ax = b with Cholesky.
+
+    Args:
+        A: Symmetric positive definite matrix.
+        b: Right-hand side vector.
+
+    Returns:
+        Solution vector x.
+
+    Note:
+        In classic LS we'd prefer QR/SVD to avoid forming X^T@X explicitly, but
+        if A is small and SPD, Cholesky is preferred.
+    """
+    L, lower = cho_factor(A, check_finite=False)
+    return cho_solve((L, lower), b, check_finite=False)
+
+
+def _build_year_design(
+    years: np.ndarray | None,
+    mode: str | None = None,
+    n_bins: int = 10,
+) -> Tuple[np.ndarray | None, Dict[str, float]]:
+    """
+    Build per-item year design matrix Y:
+    - 'cont'  -> (n x 1) centered & standardized column
+    - 'bins'  -> (n x n_bins) one-hot with quantile binning
+    
+    Args:
+        years: (n,) array of item years, or None.
+        mode: 'cont', 'bins', or None.
+        n_bins: Number of bins if mode='bins'.
+
+    Returns:
+        Y: Year design matrix, or None.
+        stats: Dict of statistics used for transformation.
+    """
+    if years is None:
+        return None, {}
+
+    years = years.astype(float)
+    stats: Dict[str, float] = {}
+
+    if mode == "cont":
+        mu = np.nanmean(years)
+        sd = max(np.nanstd(years), 1e-8)
+        y = (years - mu) / sd
+        # 
+        y[~np.isfinite(y)] = 0.0
+        stats.update({"mu": mu, "sd": sd})
+        return y[:, None], stats
+
+    if mode == "bins":
+        # Quantile bins, robust to skew
+        quantiles = np.quantile(years, np.linspace(0, 1, n_bins + 1))
+        # Ensure strictly increasing edges
+        for i in range(1, len(quantiles)):
+            if quantiles[i] <= quantiles[i - 1]:
+                quantiles[i] = quantiles[i - 1] + EPS_SPD
+        # Build one-hot encoding
+        idx = np.full(years.shape[0], 0, dtype=int)
+        finite = np.isfinite(years)
+        idx[finite] = np.clip(np.digitize(years[finite], quantiles[1:-1], right=True), 0, n_bins - 1)
+        Y = np.zeros((years.shape[0], n_bins), dtype=float)
+        Y[np.arange(years.shape[0]), idx] = 1.0
+        stats.update({"edges": quantiles})
+        return Y, stats
+
+    raise ValueError(f"Unknown year_mode '{mode}'")
+
 class ALS:
     """
     Alternating Least Squares (ALS) for collaborative filtering.
 
     Factorizes a user-item rating matrix R into three low-rank matrices:
+
+    R ≈ U @ (V + G @ W_g + Y @ W_y)^T + 
+        + μ + b_u.reshape(-1, 1) + b_i.reshape(1, -1)
+
+    by minimizing squared error on observed entries with ridge regularizations:
     
-        R ≈ U @ (V + G @ W)ᵀ
-    
+    min_{U,V,W_g,W_y,b_u,b_i,μ}  Σ_{(u,i) ∈ Ω} 
+        ( R_{u,i} - [ U_u @ ( V_i + G_i @ W_g + Y_i @ W_y ) + μ + b_u[u] + b_i[i] ] )^2
+        + λ_u ||U|| + λ_v ||V|| + λ_wg ||W_g|| + λ_wy ||W_y||
+
     where:
-        - U: user factors (m x k)
-        - V: item factors (n x k)
-        - G: one-hot genres (n x d), if provided
-        - W: learnable projection from genres → latent space (d x k)
-        - m: number of users
-        - n: number of items
-        - d: number of genres
-        - k: number of latent factors
+        - U    ∈ R^{m x k}  : user latent factors
+        - V    ∈ R^{n x k}  : item latent factors
+        - G    ∈ R^{n x d}  : item genres (one/multi-hot, row-normalized), optional
+        - W_g  ∈ R^{d x k}  : learnable projection from genres → latent space
+        - Y    ∈ R^{n x p}  : year features (continuous or binned), optional
+                - year_mode = "cont"  -> p = 1 (standardized continuous year)
+                - year_mode = "bins"  -> p = n_year_bins (one-hot quantile bins)
+        - W_y  ∈ R^{p x k}  : learnable projection from year → latent space
+        - μ    ∈ R          : global mean
+        - b_u  ∈ R^{m}      : user biases
+        - b_i  ∈ R^{n}      : item biases
+        - m                 : number of users
+        - n                 : number of items
+        - d                 : number of genres
+        - p                 : number of year features
+        - k                 : number of latent factors
+        - λ_u  ∈ R          : regularization on U
+        - λ_v  ∈ R          : regularization on V (optionally dependent on item popularity)
+        - λ_wg ∈ R          : regularization on W_g
+        - λ_wy ∈ R          : regularization on W_y
+
+    Training (ALS loop):
+        1) Fix V, W_g, W_y, b_i → update U and b_u
+        2) Fix U, W_g, W_y, b_u → update V and b_i
+        3) Periodically update W_g and W_y by ridge on observed entries
+        4) Update μ as the mean residual over observed entries
+
+    Inference:
+        predict(genres, years) returns:
+            R_hat = U @ (V + G W_g + Y W_y).T + 
+                    + μ + b_u.reshape(1, -1) + b_i.reshape(1, -1)
     """
 
     def __init__(
         self,
-        n_factors: int,
-        n_iters: int,
-        reg: float,
-        random_state: int | None = None,
+        n_factors: int = 100,
+        n_iters: int = 50,
+        lambda_u: float = 0.8,
+        lambda_v: float = 0.8,
+        lambda_wg: float = 100.0,
+        lambda_wy: float = 1.0,
+        random_state: int | None = 42,
+        year_mode: str | None = None,
+        n_year_bins: int | None = None,
+        pop_reg_mode: str | None = None,
+        update_w_every: int = 5
     ) -> None:
         """
+        Initialize ALS model.
+
         Args:
-            n_factors: Dimensionality of latent factor space (rank k).
-            n_iters: Number of ALS iterations (alternating updates).
-            reg: Regularization strength (ridge penalty λ).
-            random_state: Optional random seed for reproducibility.
+            n_factors: Number of latent factors (k).
+            n_iters: Number of ALS iterations.
+            lambda_u: Regularization for user factors U.
+            lambda_v: Regularization for item factors V.
+            lambda_wg: Regularization for genre projection W_g.
+            lambda_wy: Regularization for year projection W_y.
+            random_state: Random seed for reproducibility.
+            year_mode: How to handle year features ('cont', 'bins').
+            n_year_bins: Number of bins if year_mode='bins'.
+            pop_reg_mode: Popularity-based reg for items (c).
+            update_w_every: Frequency of updating W_g and W_y (in iterations).
         """
-        self.n_factors = n_factors
-        self.n_iters = n_iters
-        self.reg = reg
+        
+        # Hyperparameters
+        self.n_factors = int(n_factors)
+        self.n_iters = int(n_iters)
+        self.pop_reg_mode = pop_reg_mode
+        self.lambda_u = float(lambda_u)
+        self.lambda_v = float(lambda_v)
+        self.lambda_wg = float(lambda_wg)
+        self.lambda_wy = float(lambda_wy)
         self.random_state = random_state
+        self.year_mode = year_mode
+        self.n_year_bins = n_year_bins
+        self.update_w_every = int(update_w_every)
+        
+        # Learned parameters (to be filled during training)        
+        self.U: np.ndarray | None = None           # (m, k)
+        self.V: np.ndarray | None = None           # (n, k)
+        self.Wg: np.ndarray | None = None          # (d, k) genres → latent
+        self.Wy: np.ndarray | None = None          # (p, k) years  → latent
+        self.mu: float = 0.0
+        self.b_u: np.ndarray | None = None         # (m,)
+        self.b_i: np.ndarray | None = None         # (n,)
 
-        # These will be initialized during fit()
-        self.user_factors: np.ndarray | None = None
-        self.item_factors: np.ndarray | None = None
-        self.genre_factors: np.ndarray | None = None
-        self.genre_norm: np.ndarray | None = None
+        # Precomputed norms / transforms
+        self.genre_norm: np.ndarray | None = None  # (n, 1)
+        self.year_stats: Dict[str, float] = {}     # for standardization if year_mode='cont'
 
-    def fit(self, R: np.ndarray, genres: np.ndarray | None = None) -> ALS:
+    
+    def _calculate_item_reg(self, counts: np.ndarray) -> np.ndarray:
+        """Calculate item-specific regularization values based on popularity.
+
+        Args:
+            counts: Array of item popularity counts.
+
+        Returns:
+            Array of regularization values for each item.
+        """
+        if not self.pop_reg_mode:
+            return np.full_like(counts, self.lambda_v, dtype=float)
+        elif self.pop_reg_mode == "inverse_sqrt":
+            return self.lambda_v / np.sqrt(counts + 1.0)
+        else:
+            raise ValueError(f"Unknown pop_reg_mode '{self.pop_reg_mode}'")
+
+    def _enrich_item_factors(self,
+                             idx_items: np.ndarray,
+                             G: np.ndarray | None,
+                             Y: np.ndarray | None) -> np.ndarray:
+        """Enrich item factors V_i with genre and year contributions.
+
+        Args:
+            idx_items: Indices of items to enrich.
+            G: Genre matrix (n x d) or None.
+            Y: Year feature matrix (n x p) or None.
+
+        Returns:
+            Enriched item factors (len(idx_items) x k).
+        """
+        Z = self.V[idx_items].copy()
+        if (G is not None) and (self.Wg is not None):
+            Z += G[idx_items] @ self.Wg
+        if (Y is not None) and (self.Wy is not None):
+            Z += Y[idx_items] @ self.Wy
+        return Z
+
+
+    def fit(self,
+            R: np.ndarray,
+            genres: np.ndarray | None = None,
+            years: np.ndarray | None = None
+            ) -> ALS:
         """
         Fit ALS model to rating matrix.
 
         Args:
             R: (m x n) ratings matrix with np.nan for missing entries.
             genres: (n x d) genre one-hot/multi-hot matrix, or None.
+            years: (n,) array of item years, or None.
 
         Returns:
             Self (allows chaining, e.g. model.fit(R).predict()).
@@ -88,46 +264,86 @@ class ALS:
         # m users × n items
         m, n = R.shape
         
-        # Normalize genres to have unit sum per item
-        if genres is not None:
-            self.genre_norm = np.maximum(genres.sum(axis=1, keepdims=True), 1)
-            genres = genres / np.maximum(genres.sum(axis=1, keepdims=True), 1)
-
-        # Random initialization of user/item factors with small Gaussian noise
-        self.user_factors = np.random.normal(
-            scale=SCALE_FACTOR,
-            size=(m, self.n_factors)
-            )
-        self.item_factors = np.random.normal(
-            scale=SCALE_FACTOR,
-            size=(n, self.n_factors)
-            )
-
-        # If genre data is provided, initialize genre factors
-        if genres is not None:
-            d = genres.shape[1]
-            self.genre_factors = np.random.normal(
-                scale=SCALE_FACTOR,
-                size=(d, self.n_factors)
-                )
-        else:
-            self.genre_factors = None
-
         # Mask = which entries in R are observed
-        # (True = observed, False = missing)
         mask = ~np.isnan(R)
 
+        # Initialize biases to zero
+        self.mu = float(np.nanmean(R))
+        self.b_u = np.zeros(m, dtype=float)
+        self.b_i = np.zeros(n, dtype=float)
+        
+        # Normalize genres to have unit sum per item
+        G = None
+        if genres is not None:
+            self.genre_norm = np.maximum(genres.sum(axis=1, keepdims=True), 1.0)
+            G = genres / self.genre_norm
+
+        # Build year design Y
+        Y = None
+        if years is not None:
+            Y, self.year_stats = _build_year_design(years,
+                                                    self.year_mode,
+                                                    self.n_year_bins)
+
+        # Initialize factors with small Gaussian noise
+        k = self.n_factors
+
+        self.U = np.random.normal(
+            scale=SCALE_FACTOR,
+            size=(m, k)
+            )
+        self.V = np.random.normal(
+            scale=SCALE_FACTOR,
+            size=(n, k)
+            )
+
+        # If genre data is provided, initialize genre factor
+        if G is not None:
+            d = genres.shape[1]
+            self.Wg = np.random.normal(
+                scale=SCALE_FACTOR,
+                size=(d, k)
+                )
+        else:
+            self.Wg = None
+
+        # If years are provided, initialize years factor
+        if Y is not None:
+            p = Y.shape[1]
+            self.Wy = np.random.normal(
+                scale=SCALE_FACTOR,
+                size=(p, k)
+                )
+        else:
+            self.Wy = None
+
+        # Calculate item popularities for regularization
+        item_counts = mask.sum(axis=0).astype(float)
+        if self.pop_reg_mode is None:
+            # Uniform regularization
+            lambda_v_i = np.full(n, self.lambda_v, dtype=float)
+        else:
+            # Popularity-based regularization
+            lambda_v_i = self._calculate_item_reg(item_counts)
+
+        # Precompute regularization matrix for factors
+        I = np.eye(k) 
+
+        # Set up logger info
         logger.info(
             f"Starting ALS training: m={m} users, n={n} items, "
-            f"factors={self.n_factors}, n_iters={self.n_iters}, "
-            f"reg={self.reg:.4f}, random_state={self.random_state}. "
-            f"Genres {'included.' if genres is not None else 'not included.'}"
+            f"n_factors={self.n_factors}, "
+            f"n_iters={self.n_iters}, reg_u={self.lambda_u}, "
+            f"reg_v={self.lambda_v}, reg_wg={self.lambda_wg}, "
+            f"reg_wy={self.lambda_wy}. "
+            f"Genres {'included.' if genres is not None else 'not included.'} "
+            f"Years {'included.' if years is not None else 'not included.'} "
         )
 
         # Main ALS loop
         for it in trange(self.n_iters, desc="ALS iterations"):
 
-            # Update user factors
+            # (1) Update user factors
             for u in range(m):
                 # Items that user u has rated
                 idx = mask[u]
@@ -135,20 +351,21 @@ class ALS:
                 if not np.any(idx):
                     continue
 
-                # Factors of rated items
-                if self.genre_factors is None:
-                    V = self.item_factors[idx]
-                else:
-                    V = self.item_factors[idx] + genres[idx] @ self.genre_factors
-                # Ratings given by user u
-                r = R[u, idx]
+                # Enrich item factors for rated items
+                Z = self._enrich_item_factors(np.where(idx)[0], G, Y) # (nu,k)
 
-                # Solve normal equation: (VᵀV + λI) * U[u] = Vᵀr
-                A = V.T @ V + self.reg * np.eye(self.n_factors)
-                b = V.T @ r
-                self.user_factors[u] = np.linalg.solve(A, b)
+                # Compute residuals for user u after removing biases and mean
+                r = R[u, idx] - (self.mu + self.b_u[u] + self.b_i[idx])
+                A = Z.T @ Z + (self.lambda_u + EPS_SPD) * I
+                b = Z.T @ r
+                self.U[u] = _cholesky_solve(A, b)
 
-            # Update item factors
+                # Update user bias (one-step ridge on scalar)
+                denom = idx.sum() + 1e-8 + self.lambda_u
+                pred_wo_bu = (Z @ self.U[u]) + self.mu + self.b_i[idx]
+                self.b_u[u] = float(np.sum(R[u, idx] - pred_wo_bu) / denom)
+
+            # (2) Update item factors
             for i in range(n):
                 # Users that rated item i
                 idx = mask[:, i]
@@ -156,39 +373,56 @@ class ALS:
                 if not np.any(idx):
                     continue
 
-                U = self.user_factors[idx]  # Factors of users who rated i
-                r = R[idx, i]               # Ratings for item i
+                # Take user factors for users who rated item i
+                U_i = self.U[idx]  # (nu,k)
 
-                # If genre factors are used, subtract genre contribution
-                if self.genre_factors is None:
-                    A = U.T @ U + self.reg * np.eye(self.n_factors)
-                    b = U.T @ r
-                else:
-                    genre_contrib = (self.user_factors[idx] @ self.genre_factors.T) @ genres[i]
-                    r_tilde = r - genre_contrib
-                    A = U.T @ U + self.reg * np.eye(self.n_factors)
-                    b = U.T @ r_tilde
+                # Compute residuals for item i after removing biases and mean
+                r = R[idx, i] - (self.mu + self.b_u[idx] + self.b_i[i])
+                A = U_i.T @ U_i + (lambda_v_i[i] + EPS_SPD) * I
+                b = U_i.T @ r
+                self.V[i] = _cholesky_solve(A, b)
 
-                # Solve normal equation: (UᵀU + λI) * V[i] = Uᵀr
-                self.item_factors[i] = np.linalg.solve(A, b)
+                # Update item bias (one-step ridge on scalar)
+                denom = idx.sum() + EPS_SPD + lambda_v_i[i]
+                pred_wo_bi = (U_i @ self.V[i]) + self.mu + self.b_u[idx]
+                self.b_i[i] = float(np.sum(R[idx, i] - pred_wo_bi) / denom)
 
-            # Update genre factors every 5 iterations (less noisy) if applicable
-            if self.genre_factors is not None and (it % 5 == 0 or it == self.n_iters - 1):
-                X_rows, y_vals = [], []
-                for u in range(m):
-                    for i in np.where(mask[u])[0]:
-                        x = np.kron(genres[i], self.user_factors[u])
-                        y = R[u, i] - self.user_factors[u] @ self.item_factors[i]
-                        X_rows.append(x)
-                        y_vals.append(y)
-                X = np.vstack(X_rows)
-                y = np.array(y_vals)
+            # (3) Update feature projections Wg, Wy periodically
+            if (self.Wg is not None or self.Wy is not None) and (
+                (it % self.update_w_every == 0) or (it == self.n_iters - 1)
+            ):
+                # Compute residuals on all observed entries
+                rows_u, rows_i = np.where(mask)
+                r_obs = R[rows_u, rows_i] - (self.mu + self.b_u[rows_u] + self.b_i[rows_i])
+                # Remove current latent factor contribution
+                r_obs = r_obs - np.sum(self.U[rows_u] * self.V[rows_i], axis=1)
 
-                # Use stronger regularization for genre factors
-                A = X.T @ X + (10 * self.reg) * np.eye(X.shape[1])
-                b = X.T @ y
-                genre_vec = np.linalg.solve(A, b)
-                self.genre_factors = genre_vec.reshape(genres.shape[1], self.n_factors)
+                # Update Wg (genres)
+                if self.Wg is not None and G is not None:
+                    # Xg: for each obs, line = vec( U_u ⊗ G_i )  -> shape (N_obs, d*k)
+                    U_obs = self.U[rows_u]             # (N_obs, k)
+                    G_obs = G[rows_i]                  # (N_obs, d)
+                    Xg = (G_obs[:, :, None] * U_obs[:, None, :]).reshape(len(rows_u), -1)  # (N_obs, d*k)
+                    A = Xg.T @ Xg + (self.lambda_wg + EPS_SPD) * np.eye(Xg.shape[1])
+                    b = Xg.T @ r_obs
+                    vec = _cholesky_solve(A, b)
+                    self.Wg = vec.reshape(G.shape[1], self.n_factors)
+
+                # Update Wy (years)
+                if self.Wy is not None and Y is not None:
+                    # Remove genre contribution from residuals
+                    r_tmp = r_obs.copy()
+                    if self.Wg is not None and G is not None:
+                        Gw = G[rows_i] @ self.Wg       # (N_obs, k)
+                        r_tmp = r_tmp - np.sum(self.U[rows_u] * Gw, axis=1)
+
+                    U_obs = self.U[rows_u]             # (N_obs, k)
+                    Y_obs = Y[rows_i]                  # (N_obs, p)
+                    Xy = (Y_obs[:, :, None] * U_obs[:, None, :]).reshape(len(rows_u), -1)  # (N_obs, p*k)
+                    A = Xy.T @ Xy + (self.lambda_wy + EPS_SPD) * np.eye(Xy.shape[1])
+                    b = Xy.T @ r_tmp
+                    vec = _cholesky_solve(A, b)
+                    self.Wy = vec.reshape(Y.shape[1], self.n_factors)
 
             logger.debug("Completed iteration %d", it + 1)
 
@@ -196,7 +430,15 @@ class ALS:
 
         return self
     
-    def fit_laplacian(self, R: np.ndarray, genres=None, S=None, alpha=0.1) -> ALS:
+
+    # TODO @rebeccachid: Update this method to match new ALS class structure
+    def fit_laplacian(
+        self,
+        R: np.ndarray,
+        genres: np.ndarray | None = None,
+        S: np.ndarray | None = None,
+        alpha: float = 0.1,
+    ) -> ALS:
         """
         Fits the ALS model with Laplacian regularization on item factors.
 
@@ -204,14 +446,14 @@ class ALS:
         graph (here, items with similar genres) to have similar latent embeddings.
 
         Args:
-            R (np.ndarray): (m × n) ratings matrix with NaN for missing entries.
-            genres (np.ndarray | None): (n × d) optional one-hot or multi-hot item genre matrix.
-            S (np.ndarray | None): (n × n) symmetric item similarity matrix used
-                to compute the Laplacian (L = D - S).
-            alpha (float): Strength of Laplacian regularization.
+            R: (m x n) ratings matrix with NaN for missing entries.
+            genres: (n x d) optional one-hot or multi-hot item genre matrix.
+            S: (n x n) symmetric item similarity matrix used to compute the
+                       Laplacian (L = D - S).
+            alpha: Strength of Laplacian regularization.
 
         Returns:
-            self (ALS): Fitted ALS model with Laplacian regularization applied.
+            self: Fitted ALS model with Laplacian regularization applied.
         """
         if self.random_state is not None:
             np.random.seed(self.random_state)
@@ -220,13 +462,22 @@ class ALS:
         mask = ~np.isnan(R)
 
         if self.user_factors is None:
-            self.user_factors = np.random.normal(scale=SCALE_FACTOR, size=(m, self.n_factors))
+            self.user_factors = np.random.normal(
+                scale=SCALE_FACTOR,
+                size=(m, self.n_factors)
+                )
         if self.item_factors is None:
-            self.item_factors = np.random.normal(scale=SCALE_FACTOR, size=(n, self.n_factors))
+            self.item_factors = np.random.normal(
+                scale=SCALE_FACTOR,
+                size=(n, self.n_factors)
+                )
 
         if genres is not None:
             d = genres.shape[1]
-            self.genre_factors = np.random.normal(scale=SCALE_FACTOR, size=(d, self.n_factors))
+            self.genre_factors = np.random.normal(
+                scale=SCALE_FACTOR,
+                size=(d, self.n_factors)
+                )
             self.genre_norm = np.maximum(genres.sum(axis=1, keepdims=True), 1)
             genres = genres / self.genre_norm
         else:
@@ -270,23 +521,56 @@ class ALS:
         logger.info("Laplacian ALS training finished.")
         return self
 
-    def predict(self, genres) -> np.ndarray:
-        """
-        Predict the full rating matrix R̂ = U @ Vᵀ.
+    def predict(self,
+                genres: np.ndarray | None = None,
+                years: np.ndarray | None = None
+                ) -> np.ndarray:
+            """
+            Return full prediction matrix R̂ = U @ (V + G Wg + Y Wy)^T + biases.
 
-        Returns:
-            Completed ratings matrix (np.ndarray).
-        """
-        if self.user_factors is None or self.item_factors is None:
-            raise RuntimeError("Model must be fitted before prediction.")
+            Returns:
+                Completed ratings matrix (np.ndarray).
+            """
+            if self.U is None or self.V is None:
+                raise RuntimeError("Model must be fitted before prediction.")
 
-        if self.genre_factors is None or genres is None:
-            enriched_items = self.item_factors
-        else:
-            genres = genres / self.genre_norm
-            enriched_items = self.item_factors + genres @ self.genre_factors
+            n = self.V.shape[0]
+            Z = self.V.copy()
 
-        return self.user_factors @ enriched_items.T
+            # Normalize genres and add contribution if provided
+            if genres is not None and self.Wg is not None:
+                if self.genre_norm is not None:
+                    G = genres / np.maximum(self.genre_norm, 1.0)
+                else:
+                    G = genres / np.maximum(genres.sum(axis=1, keepdims=True), 1.0)
+                # Add genre contribution
+                Z += G @ self.Wg
+
+            # Build year design and add contribution if provided
+            if years is not None and self.Wy is not None:
+                # Treat years as continuous variable
+                if self.year_mode == "cont":
+                    mu, sd = self.year_stats["mu"], self.year_stats["sd"]
+                    y = (years.astype(float) - mu) / sd
+                    y[~np.isfinite(y)] = 0.0
+                    Y = y[:, None]
+                # Treat years as binned categorical variable
+                else:
+                    edges = self.year_stats["edges"]
+                    # Default bin 0 for NaNs
+                    idx = np.full(years.shape[0], 0, dtype=int)
+                    finite = np.isfinite(years)
+                    idx[finite] = np.clip(
+                        np.digitize(years[finite], edges[1:-1], right=True),
+                        0,
+                        len(edges)-2
+                        )
+                    Y = np.zeros((n, len(edges)-1), dtype=float)
+                    Y[np.arange(n), idx] = 1.0
+                # Add year contribution
+                Z += Y @ self.Wy
+
+            return self.U @ Z.T + self.mu + self.b_u[:, None] + self.b_i[None, :]
 
 
 def compute_rmse(R_true: np.ndarray, R_pred: np.ndarray) -> float:
@@ -344,70 +628,79 @@ def complete_ratings(
     train_path: str,
     test_path: str | None,
     genres_path: str | None,
-    params: Dict[str, int | float],
+    years_path: str | None,
+    params: dict[str, int | float | str | bool],
     merge: bool,
-    use_laplacian: bool = False,
+    use_laplacian: bool = False
 ) -> np.ndarray:
     """
     High-level helper function to complete ratings.
 
-    Loads data, merges train/test, trains ALS, and returns predictions.
-
     Args:
-        train_path: Path to training `.npy` file.
-        test_path: Path to test `.npy` file.
-        genres_path: Path to genres `.npy` file, or None.
-        params: Model hyperparameters (dict with keys):
-            - n_factors
-            - n_iters
-            - reg
-            - random_state
-            - (optional, for Laplacian regularization)
-                - S_topk
-                - S_eps
-                - alpha
-        merge: Whether to merge train and test (to train on all data before
-               submission).
-        use_laplacian: Whether to apply Laplacian regularization.
+        train_path : path to training `.npy`
+        test_path  : path to test `.npy` (required if merge=True)
+        genres_path: path to genres `.npy` (n_items x d_g), or None
+        years_path  : path to years `.npy` (n_items,), or None
+        params     : hyperparameters dict. Keys (all optional, sensible defaults):
+            - n_factors: int
+            - n_iters: int
+            - random_state: int
+            - lambda_u: float
+            - lambda_v: float
+            - lambda_wg: float
+            - lambda_wy: float
+            - year_mode: "cont" | "bins"
+            - n_year_bins: int
+            - pop_reg_mode: "inverse_sqrt"
+            - update_w_every: int
+            - (Laplacian) S_topk: int, S_eps: float, alpha: float
+        merge       : if True, merge TRAIN+TEST observed entries before training
+        use_laplacian: if True, use Laplacian ALS variant (uses genres graph)
 
     Returns:
-        Completed ratings matrix (np.ndarray).
+        np.ndarray of shape (m, n) with completed ratings.
     """
-    # Load train and test sets
+    # Load data
     R_train = read_data(train_path)
 
     # Merge them into a single observed matrix
     if merge:
+        if test_path is None:
+            raise ValueError("merge=True requires `test_path`.")
         R_test = read_data(test_path)
         R_merged = merge_train_test(R_train, R_test)
     else:
         R_merged = R_train
-    
-    # Load genres if provided
-    if genres_path is not None:
-        genres = read_data(genres_path)
-    else:
-        genres = None
+
+    # Load genres and years if provided
+    genres = read_data(genres_path) if genres_path is not None else None
+    years  = read_data(years_path)  if years_path  is not None else None
 
     # Initialize and fit ALS model
     model = ALS(
-        n_factors=int(params.get("n_factors")),
-        n_iters=int(params.get("n_iters")),
-        reg=float(params.get("reg")),
-        random_state=params.get("random_state"),
+        n_factors      = int(params.get("n_factors")),
+        n_iters        = int(params.get("n_iters")),
+        lambda_u       = float(params.get("lambda_u")),
+        lambda_v       = float(params.get("lambda_v")),
+        lambda_wg      = float(params.get("lambda_wg")),
+        lambda_wy      = float(params.get("lambda_wy")),
+        random_state   = int(params.get("random_state", 42)),
+        year_mode      = str(params.get("year_mode", "cont")),
+        n_year_bins    = int(params.get("n_year_bins", 10)),
+        pop_reg_mode   = params.get("pop_reg_mode", None),
+        update_w_every = int(params.get("update_w_every", 5)),
     )
 
-    # Fit with or without Laplacian regularization
     if use_laplacian:
-        S_topk = int(params.get("S_topk", 10))
-        S_eps = float(params.get("S_eps", 1e-5))
-        alpha = float(params.get("alpha", 0.1))
+        S_topk = int(params.get("S_topk"))
+        S_eps  = float(params.get("S_eps"))
+        alpha  = float(params.get("alpha"))
         if genres is not None:
             S = build_item_similarity_from_genres(genres, topk=S_topk, eps=S_eps)
         else:
             S = None
         model.fit_laplacian(R_merged, genres=None, S=S, alpha=alpha)
     else:
-        model.fit(R_merged, genres=genres)
+        model.fit(R_merged, genres=genres, years=years)
 
-    return model.predict(genres=genres)
+    return model.predict(genres=genres, years=years)
