@@ -54,15 +54,15 @@ if __name__ == '__main__':
 
     # Parameters for the new model (maybe not optimal)
     params = {
-        "n_factors": 180,
-        "n_iters": 52,
-        "lambda_u": 8.0,
-        "lambda_v": 8.0,
-        "lambda_wg": 80.0,
-        "lambda_wy": 1_000_000.0,
+        "n_factors": 1,
+        "n_iters": 42,
+        "lambda_u": 5.15,
+        "lambda_v": 8.57,
+        "lambda_wg": 297.69,
+        "lambda_wy": 1653266.0,
         "year_mode": "bins",
-        "n_year_bins": 4,
-        "update_w_every": 5,
+        "n_year_bins": 5,
+        "update_w_every": 6,
         "random_state": 42
     }
 
