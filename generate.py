@@ -59,7 +59,7 @@ if __name__ == '__main__':
         "lambda_u": 8.0,
         "lambda_v": 8.0,
         "lambda_wg": 80.0,
-        "lambda_wy": 50.0,
+        "lambda_wy": 1_000_000.0,
         "year_mode": "bins",
         "n_year_bins": 4,
         "update_w_every": 5,
