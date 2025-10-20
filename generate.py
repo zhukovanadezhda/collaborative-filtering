@@ -67,17 +67,17 @@ if __name__ == '__main__':
 
     # Complete the ratings table
     table = complete_ratings(
-        train_path="data/new/ratings_train.npy",
-        test_path="data/new/ratings_test.npy",
-        genres_path="data/new/genres.npy",
-        years_path="data/new/years.npy",
+        train_path="data/ratings_train.npy",
+        test_path="data/ratings_test.npy",
+        genres_path="data/genres.npy",
+        years_path="data/years.npy",
         params=params,
-        merge=False,
+        merge=True,
         use_laplacian=False,
     )
     
     # Print the RMSE on the test set
-    R_test = np.load("data/new/ratings_val.npy")
+    R_test = np.load("data/ratings_test.npy")
     print(f"RMSE on the test set: {compute_rmse(R_test, table):.4f}")
 
     # Save the completed table 
