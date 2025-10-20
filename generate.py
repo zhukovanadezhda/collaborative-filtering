@@ -77,9 +77,9 @@ if __name__ == '__main__':
         'lambda_wy': 0,
         'lambda_bu': 3,
         'lambda_bi': 2,
-        'S_topk': 49,
+        'S_topk': 50,
         'S_eps': 3e-05,
-        'alpha': 0.3
+        'alpha': 0.36
         }
 
     # Complete the ratings table
