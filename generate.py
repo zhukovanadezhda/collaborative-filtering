@@ -54,31 +54,30 @@ if __name__ == '__main__':
 
     # Parameters for the new model (maybe not optimal)
     params = {
-        "n_factors": 1,
-        "n_iters": 42,
-        "lambda_u": 5.15,
-        "lambda_v": 8.57,
-        "lambda_wg": 297.69,
-        "lambda_wy": 1653266.0,
-        "year_mode": "bins",
-        "n_year_bins": 5,
-        "update_w_every": 6,
-        "random_state": 42
+        'n_factors': 1,
+        'n_iters': 21,
+        'lambda_u': 6,
+        'lambda_v': 9,
+        'lambda_wg': 510,
+        'lambda_wy': 1e+4,
+        'year_mode': 'bins',
+        'n_year_bins': 2,
+        'update_w_every': 21
     }
 
     # Complete the ratings table
     table = complete_ratings(
-        train_path="data/ratings_train.npy",
-        test_path="data/ratings_test.npy",
-        genres_path="data/genres.npy",
-        years_path="data/years.npy",
+        train_path="data/new/ratings_train.npy",
+        test_path="data/new/ratings_test.npy",
+        genres_path="data/new/genres.npy",
+        years_path="data/new/years.npy",
         params=params,
         merge=False,
         use_laplacian=False,
     )
     
     # Print the RMSE on the test set
-    R_test = np.load("data/ratings_test.npy")
+    R_test = np.load("data/new/ratings_val.npy")
     print(f"RMSE on the test set: {compute_rmse(R_test, table):.4f}")
 
     # Save the completed table 
