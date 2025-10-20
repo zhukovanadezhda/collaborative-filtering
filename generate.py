@@ -89,7 +89,7 @@ if __name__ == '__main__':
         genres_path="data/genres.npy",
         years_path="data/years.npy",
         params=params,
-        merge=False,
+        merge=True,
         use_laplacian=True,
     )
 
