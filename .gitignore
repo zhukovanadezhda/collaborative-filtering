@@ -2,4 +2,5 @@
 *.ipynb_checkpoints
 *.ipynb
 *.png
-*.npy
+*.npy.DS_Store
+scripts/.DS_Store
