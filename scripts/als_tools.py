@@ -148,12 +148,14 @@ class ALS:
 
     def __init__(
         self,
-        n_factors: int = 100,
-        n_iters: int = 50,
-        lambda_u: float = 0.8,
-        lambda_v: float = 0.8,
-        lambda_wg: float = 100.0,
-        lambda_wy: float = 1.0,
+        n_factors: int,
+        n_iters: int,
+        lambda_u: float,
+        lambda_v: float,
+        lambda_wg: float,
+        lambda_wy: float,
+        lambda_bu: float | None = None,
+        lambda_bi: float | None = None,
         random_state: int | None = 42,
         year_mode: str | None = None,
         n_year_bins: int | None = None,
@@ -185,6 +187,8 @@ class ALS:
         self.lambda_v = float(lambda_v)
         self.lambda_wg = float(lambda_wg)
         self.lambda_wy = float(lambda_wy)
+        self.lambda_bu = float(lambda_bu) 
+        self.lambda_bi = float(lambda_bi)
         self.random_state = random_state
         self.year_mode = year_mode
         self.n_year_bins = n_year_bins
@@ -319,12 +323,12 @@ class ALS:
 
         # Calculate item popularities for regularization
         item_counts = mask.sum(axis=0).astype(float)
-        if self.pop_reg_mode is None:
-            # Uniform regularization
-            lambda_v_i = np.full(n, self.lambda_v, dtype=float)
-        else:
-            # Popularity-based regularization
-            lambda_v_i = self._calculate_item_reg(item_counts)
+        lambda_v_i = (
+            np.full(n, self.lambda_v, dtype=float)
+            if self.pop_reg_mode is None
+            else self._calculate_item_reg(item_counts).astype(float)
+            )
+        lambda_bi_i = np.full(n, float(self.lambda_bi), dtype=float)    
 
         # Precompute regularization matrix for factors
         I = np.eye(k) 
@@ -361,7 +365,7 @@ class ALS:
                 self.U[u] = _cholesky_solve(A, b)
 
                 # Update user bias (one-step ridge on scalar)
-                denom = idx.sum() + 1e-8 + self.lambda_u
+                denom = idx.sum() + 1e-8 + self.lambda_bu
                 pred_wo_bu = (Z @ self.U[u]) + self.mu + self.b_i[idx]
                 self.b_u[u] = float(np.sum(R[u, idx] - pred_wo_bu) / denom)
 
@@ -383,7 +387,7 @@ class ALS:
                 self.V[i] = _cholesky_solve(A, b)
 
                 # Update item bias (one-step ridge on scalar)
-                denom = idx.sum() + EPS_SPD + lambda_v_i[i]
+                denom = idx.sum() + EPS_SPD + lambda_bi_i[i]
                 pred_wo_bi = (U_i @ self.V[i]) + self.mu + self.b_u[idx]
                 self.b_i[i] = float(np.sum(R[idx, i] - pred_wo_bi) / denom)
 
@@ -684,6 +688,8 @@ def complete_ratings(
         lambda_v       = float(params.get("lambda_v")),
         lambda_wg      = float(params.get("lambda_wg")),
         lambda_wy      = float(params.get("lambda_wy")),
+        lambda_bu      = float(params.get("lambda_bu")),
+        lambda_bi      = float(params.get("lambda_bi")),
         random_state   = int(params.get("random_state", 42)),
         year_mode      = str(params.get("year_mode", "cont")),
         n_year_bins    = int(params.get("n_year_bins", 10)),

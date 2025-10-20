@@ -56,12 +56,14 @@ if __name__ == '__main__':
     params = {
         'n_factors': 1,
         'n_iters': 21,
-        'lambda_u': 6,
-        'lambda_v': 9,
+        'lambda_u': 7,
+        'lambda_v': 13,
         'lambda_wg': 510,
         'lambda_wy': 1e+4,
+        'lambda_bu': 2.5,
+        'lambda_bi': 6.5,
         'year_mode': 'bins',
-        'n_year_bins': 2,
+        'n_year_bins': 1,
         'update_w_every': 21
     }
 
@@ -72,7 +74,7 @@ if __name__ == '__main__':
         genres_path="data/genres.npy",
         years_path="data/years.npy",
         params=params,
-        merge=True,
+        merge=False,
         use_laplacian=False,
     )
     
