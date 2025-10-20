@@ -3,4 +3,5 @@
 *.ipynb
 *.png
 *.npy.DS_Store
-scripts/.DS_Store
+*.DS_Store
+*data/.tmp_als

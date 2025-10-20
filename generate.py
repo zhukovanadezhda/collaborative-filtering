@@ -66,6 +66,18 @@ if __name__ == '__main__':
         "random_state": 42
     }
 
+    # Parameters for new laplacian graph regularization
+    params = {'n_factors': 147,
+        'n_iters': 35,
+        'lambda_u': 4.900486981333446,
+        'lambda_v': 3.815412021187967,
+        'lambda_wg': 5.3132623529147684,
+        'lambda_wy': 0.002808603510906816,
+        'S_topk': 49,
+        'S_eps': 2.9725324207404996e-05,
+        'alpha': 0.07762450534045658
+        }
+
     # Complete the ratings table
     table = complete_ratings(
         train_path="data/ratings_train.npy",

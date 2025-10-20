@@ -431,7 +431,6 @@ class ALS:
         return self
     
 
-    # TODO @rebeccachid: Update this method to match new ALS class structure
     def fit_laplacian(
         self,
         R: np.ndarray,
@@ -461,62 +460,93 @@ class ALS:
         m, n = R.shape
         mask = ~np.isnan(R)
 
-        if self.user_factors is None:
-            self.user_factors = np.random.normal(
-                scale=SCALE_FACTOR,
-                size=(m, self.n_factors)
-                )
-        if self.item_factors is None:
-            self.item_factors = np.random.normal(
-                scale=SCALE_FACTOR,
-                size=(n, self.n_factors)
-                )
+        # Initialize biases around global mean
+        self.mu = float(np.nanmean(R))
+        self.b_u = np.zeros(m, dtype=float)
+        self.b_i = np.zeros(n, dtype=float)
 
+        # Normalize genres if provided
+        G = None
+        self.genre_norm = None
         if genres is not None:
-            d = genres.shape[1]
-            self.genre_factors = np.random.normal(
-                scale=SCALE_FACTOR,
-                size=(d, self.n_factors)
-                )
-            self.genre_norm = np.maximum(genres.sum(axis=1, keepdims=True), 1)
-            genres = genres / self.genre_norm
+            self.genre_norm = np.maximum(genres.sum(axis=1, keepdims=True), 1.0)
+            G = genres / self.genre_norm
+
+        # Reset learned parameters to align with current training call
+        k = self.n_factors
+        self.U = np.random.normal(scale=SCALE_FACTOR, size=(m, k))
+        self.V = np.random.normal(scale=SCALE_FACTOR, size=(n, k))
+        if G is not None:
+            self.Wg = np.zeros((G.shape[1], k), dtype=float)
         else:
-            self.genre_factors = None
+            self.Wg = None
+        self.Wy = None
+        self.year_stats = {}
+
+        # Item-specific regularization (e.g., popularity based)
+        item_counts = mask.sum(axis=0).astype(float)
+        lambda_v_i = self._calculate_item_reg(item_counts)
 
         if S is not None:
             D = S.sum(axis=1)
         else:
-            D = np.zeros(n)
+            D = np.zeros(n, dtype=float)
+
+        I = np.eye(k)
 
         logger.info(f"Starting Laplacian ALS training α={alpha}")
 
         for it in trange(self.n_iters, desc="Laplacian ALS"):
-            # User update
+            # Update user factors and biases
             for u in range(m):
-                idx = mask[u]
-                if not np.any(idx):
+                idx_items = np.where(mask[u])[0]
+                if idx_items.size == 0:
                     continue
-                if self.genre_factors is None:
-                    V = self.item_factors[idx]
-                else:
-                    V = self.item_factors[idx] + genres[idx] @ self.genre_factors
-                r = R[u, idx]
-                A = V.T @ V + self.reg * np.eye(self.n_factors)
-                b = V.T @ r
-                self.user_factors[u] = np.linalg.solve(A, b)
 
-            # Item update with Laplacian
+                Z = self._enrich_item_factors(idx_items, G, None)
+                r = R[u, idx_items] - (self.mu + self.b_u[u] + self.b_i[idx_items])
+                A = Z.T @ Z + (self.lambda_u + EPS_SPD) * I
+                b = Z.T @ r
+                self.U[u] = _cholesky_solve(A, b)
+
+                denom = idx_items.size + self.lambda_u + EPS_SPD
+                pred_wo_bu = (Z @ self.U[u]) + self.mu + self.b_i[idx_items]
+                self.b_u[u] = float(np.sum(R[u, idx_items] - pred_wo_bu) / denom)
+
+            # Update item factors with Laplacian regularization and item biases
             for i in range(n):
-                idx = mask[:, i]
-                if not np.any(idx):
+                idx_users = np.where(mask[:, i])[0]
+                if idx_users.size == 0:
                     continue
-                U = self.user_factors[idx]
-                r = R[idx, i]
-                A = U.T @ U + (self.reg + alpha * D[i]) * np.eye(self.n_factors)
-                b = U.T @ r
+
+                U_i = self.U[idx_users]
+                r = R[idx_users, i] - (self.mu + self.b_u[idx_users] + self.b_i[i])
+                reg = lambda_v_i[i] + alpha * D[i] + EPS_SPD
+                A = U_i.T @ U_i + reg * I
+                b = U_i.T @ r
                 if S is not None:
-                    b += alpha * np.sum(S[i, :, None] * self.item_factors, axis=0)
-                self.item_factors[i] = np.linalg.solve(A, b)
+                    b += alpha * (S[i] @ self.V)
+                self.V[i] = _cholesky_solve(A, b)
+
+                denom = idx_users.size + lambda_v_i[i] + EPS_SPD
+                pred_wo_bi = (U_i @ self.V[i]) + self.mu + self.b_u[idx_users]
+                self.b_i[i] = float(np.sum(R[idx_users, i] - pred_wo_bi) / denom)
+
+            # Update genre projection periodically
+            if self.Wg is not None and G is not None and (
+                (it % self.update_w_every == 0) or (it == self.n_iters - 1)
+            ):
+                rows_u, rows_i = np.where(mask)
+                r_obs = R[rows_u, rows_i] - (self.mu + self.b_u[rows_u] + self.b_i[rows_i])
+                r_obs = r_obs - np.sum(self.U[rows_u] * self.V[rows_i], axis=1)
+
+                U_obs = self.U[rows_u]
+                G_obs = G[rows_i]
+                Xg = (G_obs[:, :, None] * U_obs[:, None, :]).reshape(len(rows_u), -1)
+                A = Xg.T @ Xg + (self.lambda_wg + EPS_SPD) * np.eye(Xg.shape[1])
+                b = Xg.T @ r_obs
+                vec = _cholesky_solve(A, b)
+                self.Wg = vec.reshape(G.shape[1], self.n_factors)
 
         logger.info("Laplacian ALS training finished.")
         return self
@@ -699,7 +729,7 @@ def complete_ratings(
             S = build_item_similarity_from_genres(genres, topk=S_topk, eps=S_eps)
         else:
             S = None
-        model.fit_laplacian(R_merged, genres=None, S=S, alpha=alpha)
+        model.fit_laplacian(R_merged, genres=None, S=S, alpha=alpha) # genres direct addition to MF deactivated 
     else:
         model.fit(R_merged, genres=genres, years=years)
 
