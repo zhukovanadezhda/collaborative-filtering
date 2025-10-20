@@ -6,18 +6,17 @@ missing ratings.
 """
 
 from __future__ import annotations
+
 import logging
-from typing import Dict, Tuple, Any
 import numpy as np
 from scipy.linalg import cho_factor, cho_solve
+from typing import Dict, Tuple
 from tqdm import trange
-
-from scripts.laplacian_tools import build_item_similarity_from_genres
 
 # Scale factor for random initialization of latent factors
 SCALE_FACTOR = 0.1
 # Small epsilon for numerical stability (to ensure SPD matrices)
-EPS_SPD = 1e-10
+EPS = 1e-10
 
 # Set up logging
 logging.basicConfig(
@@ -43,6 +42,43 @@ def _cholesky_solve(A: np.ndarray, b: np.ndarray) -> np.ndarray:
     """
     L, lower = cho_factor(A, check_finite=False)
     return cho_solve((L, lower), b, check_finite=False)
+
+
+def _build_item_similarity_from_genres(
+    genres: np.ndarray,
+    topk: int = 50,
+    eps: float = 1e-8
+    ) -> np.ndarray:
+    """Build item-item similarity matrix from genres.
+
+    Args:
+        genres (np.ndarray): Item genres (one-hot encoded).
+        topk (int, optional): Number of top similar items to keep.
+        eps (float, optional): Small value to avoid division by zero.
+
+    Returns:
+        np.ndarray: Item-item similarity matrix.
+    """
+    # Row-normalize
+    g = genres / np.maximum(genres.sum(axis=1, keepdims=True), 1.0)
+
+    # Cosine similarity (n x n)
+    norms = np.sqrt((g * g).sum(axis=1, keepdims=True)) + eps
+    g_norm = g / norms
+    S = g_norm @ g_norm.T
+    np.fill_diagonal(S, 0.0)
+
+    # Keep topk per row
+    n = S.shape[0]
+    for i in range(n):
+        if topk < n:
+            idx = np.argpartition(S[i], -(topk))[:-(topk)]
+            S[i, idx] = 0.0
+
+    # Symmetrize (max to keep strongest)
+    S = np.maximum(S, S.T)
+
+    return S
 
 
 def _build_year_design(
@@ -85,7 +121,7 @@ def _build_year_design(
         # Ensure strictly increasing edges
         for i in range(1, len(quantiles)):
             if quantiles[i] <= quantiles[i - 1]:
-                quantiles[i] = quantiles[i - 1] + EPS_SPD
+                quantiles[i] = quantiles[i - 1] + EPS
         # Build one-hot encoding
         idx = np.full(years.shape[0], 0, dtype=int)
         finite = np.isfinite(years)
@@ -175,7 +211,7 @@ class ALS:
             random_state: Random seed for reproducibility.
             year_mode: How to handle year features ('cont', 'bins').
             n_year_bins: Number of bins if year_mode='bins'.
-            pop_reg_mode: Popularity-based reg for items (c).
+            pop_reg_mode: Popularity-based reg for items ('inverse_sqrt', None).
             update_w_every: Frequency of updating W_g and W_y (in iterations).
         """
         
@@ -187,8 +223,8 @@ class ALS:
         self.lambda_v = float(lambda_v)
         self.lambda_wg = float(lambda_wg)
         self.lambda_wy = float(lambda_wy)
-        self.lambda_bu = float(lambda_bu) 
-        self.lambda_bi = float(lambda_bi)
+        self.lambda_bu = float(lambda_bu) if lambda_bu is not None else float(lambda_u)
+        self.lambda_bi = float(lambda_bi) if lambda_bi is not None else float(lambda_v)
         self.random_state = random_state
         self.year_mode = year_mode
         self.n_year_bins = n_year_bins
@@ -262,8 +298,7 @@ class ALS:
         Returns:
             Self (allows chaining, e.g. model.fit(R).predict()).
         """
-        if self.random_state is not None:
-            np.random.seed(self.random_state)
+        rng = np.random.default_rng(self.random_state)
 
         # m users × n items
         m, n = R.shape
@@ -292,11 +327,11 @@ class ALS:
         # Initialize factors with small Gaussian noise
         k = self.n_factors
 
-        self.U = np.random.normal(
+        self.U = rng.normal(
             scale=SCALE_FACTOR,
             size=(m, k)
             )
-        self.V = np.random.normal(
+        self.V = rng.normal(
             scale=SCALE_FACTOR,
             size=(n, k)
             )
@@ -304,7 +339,7 @@ class ALS:
         # If genre data is provided, initialize genre factor
         if G is not None:
             d = genres.shape[1]
-            self.Wg = np.random.normal(
+            self.Wg = rng.normal(
                 scale=SCALE_FACTOR,
                 size=(d, k)
                 )
@@ -314,7 +349,7 @@ class ALS:
         # If years are provided, initialize years factor
         if Y is not None:
             p = Y.shape[1]
-            self.Wy = np.random.normal(
+            self.Wy = rng.normal(
                 scale=SCALE_FACTOR,
                 size=(p, k)
                 )
@@ -323,11 +358,8 @@ class ALS:
 
         # Calculate item popularities for regularization
         item_counts = mask.sum(axis=0).astype(float)
-        lambda_v_i = (
-            np.full(n, self.lambda_v, dtype=float)
-            if self.pop_reg_mode is None
-            else self._calculate_item_reg(item_counts).astype(float)
-            )
+        # Returns uniform or popularity-based regularization based on self.pop_reg_mode
+        lambda_v_i = self._calculate_item_reg(item_counts).astype(float)
         lambda_bi_i = np.full(n, float(self.lambda_bi), dtype=float)    
 
         # Precompute regularization matrix for factors
@@ -339,11 +371,11 @@ class ALS:
             f"n_factors={self.n_factors}, "
             f"n_iters={self.n_iters}, reg_u={self.lambda_u}, "
             f"reg_v={self.lambda_v}, reg_wg={self.lambda_wg}, "
-            f"reg_wy={self.lambda_wy}. "
+            f"reg_wy={self.lambda_wy}, reg_bu={self.lambda_bu}, "
+            f"reg_bi={self.lambda_bi}. "
             f"Genres {'included.' if genres is not None else 'not included.'} "
             f"Years {'included.' if years is not None else 'not included.'} "
         )
-
         # Main ALS loop
         for it in trange(self.n_iters, desc="ALS iterations"):
 
@@ -360,12 +392,12 @@ class ALS:
 
                 # Compute residuals for user u after removing biases and mean
                 r = R[u, idx] - (self.mu + self.b_u[u] + self.b_i[idx])
-                A = Z.T @ Z + (self.lambda_u + EPS_SPD) * I
+                A = Z.T @ Z + (self.lambda_u + EPS) * I
                 b = Z.T @ r
                 self.U[u] = _cholesky_solve(A, b)
 
                 # Update user bias (one-step ridge on scalar)
-                denom = idx.sum() + 1e-8 + self.lambda_bu
+                denom = idx.sum() + self.lambda_bu + EPS
                 pred_wo_bu = (Z @ self.U[u]) + self.mu + self.b_i[idx]
                 self.b_u[u] = float(np.sum(R[u, idx] - pred_wo_bu) / denom)
 
@@ -382,12 +414,12 @@ class ALS:
 
                 # Compute residuals for item i after removing biases and mean
                 r = R[idx, i] - (self.mu + self.b_u[idx] + self.b_i[i])
-                A = U_i.T @ U_i + (lambda_v_i[i] + EPS_SPD) * I
+                A = U_i.T @ U_i + (lambda_v_i[i] + EPS) * I
                 b = U_i.T @ r
                 self.V[i] = _cholesky_solve(A, b)
 
                 # Update item bias (one-step ridge on scalar)
-                denom = idx.sum() + EPS_SPD + lambda_bi_i[i]
+                denom = idx.sum() + lambda_bi_i[i] + EPS
                 pred_wo_bi = (U_i @ self.V[i]) + self.mu + self.b_u[idx]
                 self.b_i[i] = float(np.sum(R[idx, i] - pred_wo_bi) / denom)
 
@@ -407,7 +439,7 @@ class ALS:
                     U_obs = self.U[rows_u]             # (N_obs, k)
                     G_obs = G[rows_i]                  # (N_obs, d)
                     Xg = (G_obs[:, :, None] * U_obs[:, None, :]).reshape(len(rows_u), -1)  # (N_obs, d*k)
-                    A = Xg.T @ Xg + (self.lambda_wg + EPS_SPD) * np.eye(Xg.shape[1])
+                    A = Xg.T @ Xg + (self.lambda_wg + EPS) * np.eye(Xg.shape[1])
                     b = Xg.T @ r_obs
                     vec = _cholesky_solve(A, b)
                     self.Wg = vec.reshape(G.shape[1], self.n_factors)
@@ -423,10 +455,17 @@ class ALS:
                     U_obs = self.U[rows_u]             # (N_obs, k)
                     Y_obs = Y[rows_i]                  # (N_obs, p)
                     Xy = (Y_obs[:, :, None] * U_obs[:, None, :]).reshape(len(rows_u), -1)  # (N_obs, p*k)
-                    A = Xy.T @ Xy + (self.lambda_wy + EPS_SPD) * np.eye(Xy.shape[1])
+                    A = Xy.T @ Xy + (self.lambda_wy + EPS) * np.eye(Xy.shape[1])
                     b = Xy.T @ r_tmp
                     vec = _cholesky_solve(A, b)
                     self.Wy = vec.reshape(Y.shape[1], self.n_factors)
+
+            # (4) Update global mean μ
+            rows_u, rows_i = np.where(mask)
+            Z_rows = self._enrich_item_factors(rows_i, G, Y)        # (N_obs, k)
+            pred_wo_mu = (np.sum(self.U[rows_u] * Z_rows, axis=1) 
+                          + self.b_u[rows_u] + self.b_i[rows_i])
+            self.mu = float(np.mean(R[rows_u, rows_i] - pred_wo_mu))
 
             logger.debug("Completed iteration %d", it + 1)
 
@@ -439,6 +478,7 @@ class ALS:
         self,
         R: np.ndarray,
         genres: np.ndarray | None = None,
+        years: np.ndarray | None = None,
         S: np.ndarray | None = None,
         alpha: float = 0.1,
     ) -> ALS:
@@ -458,8 +498,7 @@ class ALS:
         Returns:
             self: Fitted ALS model with Laplacian regularization applied.
         """
-        if self.random_state is not None:
-            np.random.seed(self.random_state)
+        rng = np.random.default_rng(self.random_state)
 
         m, n = R.shape
         mask = ~np.isnan(R)
@@ -478,8 +517,8 @@ class ALS:
 
         # Reset learned parameters to align with current training call
         k = self.n_factors
-        self.U = np.random.normal(scale=SCALE_FACTOR, size=(m, k))
-        self.V = np.random.normal(scale=SCALE_FACTOR, size=(n, k))
+        self.U = rng.normal(scale=SCALE_FACTOR, size=(m, k))
+        self.V = rng.normal(scale=SCALE_FACTOR, size=(n, k))
         if G is not None:
             self.Wg = np.zeros((G.shape[1], k), dtype=float)
         else:
@@ -487,9 +526,10 @@ class ALS:
         self.Wy = None
         self.year_stats = {}
 
-        # Item-specific regularization (e.g., popularity based)
+        # Calculate item popularities for regularization
         item_counts = mask.sum(axis=0).astype(float)
         lambda_v_i = self._calculate_item_reg(item_counts)
+        lambda_bi_i = np.full(n, float(self.lambda_bi), dtype=float)
 
         if S is not None:
             D = S.sum(axis=1)
@@ -498,7 +538,16 @@ class ALS:
 
         I = np.eye(k)
 
-        logger.info(f"Starting Laplacian ALS training α={alpha}")
+        logger.info(
+            f"Starting Laplacian ALS training: m={m} users, n={n} items, "
+            f"α={alpha}, n_factors={self.n_factors}, "
+            f"n_iters={self.n_iters}, reg_u={self.lambda_u}, "
+            f"reg_v={self.lambda_v}, reg_wg={self.lambda_wg}, "
+            f"reg_wy={self.lambda_wy}, reg_bu={self.lambda_bu}, "
+            f"reg_bi={self.lambda_bi}. "
+            f"Genres {'included.' if genres is not None else 'not included.'} "
+            f"Years {'included.' if years is not None else 'not included.'} "
+        )
 
         for it in trange(self.n_iters, desc="Laplacian ALS"):
             # Update user factors and biases
@@ -509,11 +558,11 @@ class ALS:
 
                 Z = self._enrich_item_factors(idx_items, G, None)
                 r = R[u, idx_items] - (self.mu + self.b_u[u] + self.b_i[idx_items])
-                A = Z.T @ Z + (self.lambda_u + EPS_SPD) * I
+                A = Z.T @ Z + (self.lambda_u + EPS) * I
                 b = Z.T @ r
                 self.U[u] = _cholesky_solve(A, b)
 
-                denom = idx_items.size + self.lambda_u + EPS_SPD
+                denom = idx_items.size + self.lambda_bu + EPS
                 pred_wo_bu = (Z @ self.U[u]) + self.mu + self.b_i[idx_items]
                 self.b_u[u] = float(np.sum(R[u, idx_items] - pred_wo_bu) / denom)
 
@@ -525,14 +574,14 @@ class ALS:
 
                 U_i = self.U[idx_users]
                 r = R[idx_users, i] - (self.mu + self.b_u[idx_users] + self.b_i[i])
-                reg = lambda_v_i[i] + alpha * D[i] + EPS_SPD
+                reg = lambda_v_i[i] + alpha * D[i] + EPS
                 A = U_i.T @ U_i + reg * I
                 b = U_i.T @ r
                 if S is not None:
                     b += alpha * (S[i] @ self.V)
                 self.V[i] = _cholesky_solve(A, b)
 
-                denom = idx_users.size + lambda_v_i[i] + EPS_SPD
+                denom = idx_users.size + lambda_bi_i[i] + EPS
                 pred_wo_bi = (U_i @ self.V[i]) + self.mu + self.b_u[idx_users]
                 self.b_i[i] = float(np.sum(R[idx_users, i] - pred_wo_bi) / denom)
 
@@ -547,7 +596,7 @@ class ALS:
                 U_obs = self.U[rows_u]
                 G_obs = G[rows_i]
                 Xg = (G_obs[:, :, None] * U_obs[:, None, :]).reshape(len(rows_u), -1)
-                A = Xg.T @ Xg + (self.lambda_wg + EPS_SPD) * np.eye(Xg.shape[1])
+                A = Xg.T @ Xg + (self.lambda_wg + EPS) * np.eye(Xg.shape[1])
                 b = Xg.T @ r_obs
                 vec = _cholesky_solve(A, b)
                 self.Wg = vec.reshape(G.shape[1], self.n_factors)
@@ -662,9 +711,9 @@ def complete_ratings(
     train_path: str,
     test_path: str | None,
     genres_path: str | None,
-    years_path: str | None,
     params: dict[str, int | float | str | bool],
     merge: bool,
+    years_path: str | None = None,
     use_laplacian: bool = False
 ) -> np.ndarray:
     """
@@ -683,6 +732,8 @@ def complete_ratings(
             - lambda_v: float
             - lambda_wg: float
             - lambda_wy: float
+            - lambda_bu: float
+            - lambda_bi: float
             - year_mode: "cont" | "bins"
             - n_year_bins: int
             - pop_reg_mode: "inverse_sqrt"
@@ -722,7 +773,7 @@ def complete_ratings(
         lambda_bi      = float(params.get("lambda_bi")),
         random_state   = int(params.get("random_state", 42)),
         year_mode      = str(params.get("year_mode", "cont")),
-        n_year_bins    = int(params.get("n_year_bins", 10)),
+        n_year_bins    = int(params.get("n_year_bins", 1)),
         pop_reg_mode   = params.get("pop_reg_mode", None),
         update_w_every = int(params.get("update_w_every", 5)),
     )
@@ -732,10 +783,11 @@ def complete_ratings(
         S_eps  = float(params.get("S_eps"))
         alpha  = float(params.get("alpha"))
         if genres is not None:
-            S = build_item_similarity_from_genres(genres, topk=S_topk, eps=S_eps)
+            S = _build_item_similarity_from_genres(genres, topk=S_topk, eps=S_eps)
         else:
             S = None
-        model.fit_laplacian(R_merged, genres=None, S=S, alpha=alpha) # genres direct addition to MF deactivated 
+        # Genres term is deactivated in Laplacian ALS
+        model.fit_laplacian(R_merged, genres=None, years=None, S=S, alpha=alpha)
     else:
         model.fit(R_merged, genres=genres, years=years)
 
