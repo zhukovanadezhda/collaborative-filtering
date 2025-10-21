@@ -52,35 +52,35 @@ if __name__ == '__main__':
     #     "alpha": 0.7
     # }
 
-    # # Parameters for the new model (maybe not optimal)
-    # params = {
-    #     'n_factors': 1,
-    #     'n_iters': 21,
-    #     'lambda_u': 7,
-    #     'lambda_v': 13,
-    #     'lambda_wg': 510,
-    #     'lambda_wy': 1e+4,
-    #     'lambda_bu': 2.5,
-    #     'lambda_bi': 6.5,
-    #     'year_mode': 'bins',
-    #     'n_year_bins': 1,
-    #     'update_w_every': 21
-    # }
-
-    # Parameters for new laplacian graph regularization
+    # Parameters for the new model (maybe not optimal)
     params = {
-        'n_factors': 150,
-        'n_iters': 35,
-        'lambda_u': 5,
-        'lambda_v': 4,
-        'lambda_wg': 5,
-        'lambda_wy': 0,
-        'lambda_bu': 3,
-        'lambda_bi': 2,
-        'S_topk': 50,
-        'S_eps': 3e-05,
-        'alpha': 0.36
-        }
+        'n_factors': 1,
+        'n_iters': 23,
+        'lambda_u': 10,
+        'lambda_v': 13,
+        'lambda_wg': 510,
+        'lambda_wy': 1e+4,
+        'lambda_bu': 2,
+        'lambda_bi': 4,
+        'year_mode': 'bins',
+        'n_year_bins': 1,
+        'update_w_every': 21
+    }
+
+    # # Parameters for new laplacian graph regularization
+    # params = {
+    #     'n_factors': 150,
+    #     'n_iters': 35,
+    #     'lambda_u': 5,
+    #     'lambda_v': 4,
+    #     'lambda_wg': 5,
+    #     'lambda_wy': 0,
+    #     'lambda_bu': 3,
+    #     'lambda_bi': 2,
+    #     'S_topk': 50,
+    #     'S_eps': 3e-05,
+    #     'alpha': 0.36
+    #     }
 
     # Complete the ratings table
     table = complete_ratings(
@@ -90,7 +90,7 @@ if __name__ == '__main__':
         years_path="data/years.npy",
         params=params,
         merge=True,
-        use_laplacian=True,
+        use_laplacian=False,
     )
 
     # Print the RMSE on the test set
