@@ -82,7 +82,6 @@ Notes
 from __future__ import annotations
 
 import logging
-from typing import Dict
 
 import numpy as np
 from tqdm import trange
@@ -135,7 +134,7 @@ class ALS:
     def __init__(
         self,
         config: ALSConfig,
-        lambda_w: Dict[str, float] | None = None
+        lambda_w: dict[str, float] | None = None
     ) -> None:
         """
         Initialize ALS model.
@@ -150,8 +149,8 @@ class ALS:
             self.cfg = config
 
         # Learned projection matrices per feature (name -> W_f)
-        self.W: Dict[str, np.ndarray] = {}
-        self.lambda_w: Dict[str, float] = dict(lambda_w or {})
+        self.W: dict[str, np.ndarray] = {}
+        self.lambda_w: dict[str, float] = dict(lambda_w or {})
 
         # Core hyperparameters
         core = self.cfg.core
@@ -183,7 +182,7 @@ class ALS:
         self.S: np.ndarray | None = None
 
         # Training history
-        self.history: Dict[str, list[float]] = {
+        self.history: dict[str, list[float]] = {
             "train_rmse": [],
             "U_norm": [],
             "V_norm": [],
@@ -194,7 +193,7 @@ class ALS:
 
     def _build_item_similarity_from_feature(
         self,
-        features: Dict[str, np.ndarray],
+        features: dict[str, np.ndarray],
         ) -> np.ndarray | None:
         """
         Build an item-item cosine similarity matrix S using the feature.
@@ -219,7 +218,7 @@ class ALS:
         # Check if feature matrix is present
         if X is None:
             logger.warning(f"GraphSim feature '{f_name}' not found in "
-                           f"features dict. Graph regularization disabled.")
+                        f"features dict. Graph regularization disabled.")
             return None
 
         # Cosine on rows of X
@@ -260,33 +259,50 @@ class ALS:
             raise ValueError(f"Unknown pop_reg_mode '{self.pop_reg_mode}'")
 
 
-    def _enrich_item_factors_with_features(
+    def _compose_Z(
         self,
-        idx_items: np.ndarray,
-        features: Dict[str, np.ndarray]
-    ) -> np.ndarray:
-        """Compute enriched item factors Z_i for selected items: 
-
-            Z_i = V_i + Σ_f X_f[i] W_f.
-        
+        V: np.ndarray,
+        features: dict[str, np.ndarray]
+        ) -> np.ndarray:
+        """Compute full enriched item factors Z:
+            Z = V + Σ_f X_f W_f.
         Args:
-            idx_items: Indices of items to enrich.
+            V: Item factors matrix (n x k).
             features: Dictionary of feature matrices (name -> X).
 
         Returns:
-            Enriched item factors (len(idx_items) x k).
+            Enriched item factors (n x k).
         """
-        Z = self.V[idx_items].copy()
+        Z = V.copy()
         for name, X in features.items():
             W = self.W.get(name)
             if W is not None:
-                Z += X[idx_items] @ W
+                Z += X @ W
         return Z
+
+    def _converged(
+        self,
+        tol: float,
+        window: int = 2
+        ) -> bool:
+        """Check convergence based on training RMSE history.
+        Args:
+            tol: Tolerance for convergence.
+            window: Number of iterations to consider for convergence.
+
+        Returns:
+            True if converged, False otherwise.
+        """
+        h = self.history["train_rmse"]
+        return len(h) >= window+1 and (h[-window-1] - h[-1]) <= tol
 
 
     def fit(self,
             R: np.ndarray,
-            features: Dict[str, np.ndarray] | None = None,
+            features: dict[str, np.ndarray] | None = None,
+            tol: float = 1e-3,
+            min_iters: int = 5,
+            verbose: int = 1
             ) -> ALS:
         """
         Fit the model to a ratings matrix with optional item features.
@@ -294,6 +310,9 @@ class ALS:
         Args:
             R: (m x n) ratings matrix with np.nan for missing entries.
             features: Dictionary of feature matrices (name -> X).
+            tol: Tolerance for early stopping based on RMSE improvement.
+            min_iters: Minimum number of iterations before checking for convergence.
+            verbose: Verbosity level (0 = silent, 1 = info).
 
         Returns:
             The fitted model.
@@ -302,6 +321,10 @@ class ALS:
             ValueError: If feature matrices have incompatible shapes or
                         contain infinite values (e.g. NaN).
         """
+        # Set verbosity
+        if verbose == 0:
+            logging.disable(logging.CRITICAL)
+
         # Set random generator
         rng = np.random.default_rng(self.random_state)
 
@@ -310,6 +333,11 @@ class ALS:
         
         # Mask = which entries in R are observed
         mask = ~np.isnan(R)
+
+        # Precompute user-items and item-users lists
+        user_items = [np.flatnonzero(mask[u]) for u in range(m)]
+        item_users = [np.flatnonzero(mask[:, i]) for i in range(n)]
+        rows_u, rows_i = np.where(mask)
 
         # Prepare feature matrices
         features = features or {}
@@ -323,7 +351,7 @@ class ALS:
                 raise ValueError(f"Feature '{name}' contains infinite values.")
 
         # Graph regularization (if enabled and feature available)
-        use_graph = (self.alpha > 0.0) and (self.S_topk is not None)
+        use_graph = (self.alpha > 0.0) and (self.cfg.graph.sim is not None)
         self.S = self._build_item_similarity_from_feature(features) if use_graph else None
         use_graph = bool(self.S is not None)
         D = self.S.sum(axis=1) if use_graph else None
@@ -355,43 +383,61 @@ class ALS:
         # TODO: allow popularity-based reg for biases too
         lambda_bi_i = np.full(n, float(self.lambda_bi), dtype=float)    
 
-        # Precompute observed coordinate pairs once (mask is static)
-        rows_u, rows_i = np.where(mask)
+        # Prepare iterator
+        if verbose == 0:
+            iterator = range(self.n_iters)
+        else:
+            iterator = trange(self.n_iters, desc="ALS iterations", disable=False)
+            # Print initial info with all params
+            logger.info(f"Starting ALS training: "
+                        f"n_factors={k}, n_iters={self.n_iters}, "
+                        f"lambda_u={self.lambda_u}, lambda_v={self.lambda_v}, "
+                        f"pop_reg_mode={self.pop_reg_mode}, "
+                        f"features={[name for name in features.keys()]}, "
+                        f"lambda_w={self.lambda_w}, "
+                        f"random_state={self.random_state}, "
+                        f"graph_alpha={self.alpha}, "
+                        f"graph_sim_feature="
+                        f"{self.cfg.graph.sim.feature_name if self.cfg.graph.sim else None}, "
+                        f"graph_topk={self.S_topk}, "
+                        f"graph_eps={self.S_eps}, "
+                        f"update_w_every={self.update_w_every})")
+
 
         # Main ALS loop
-        for it in trange(self.n_iters, desc="ALS iterations"):
+        for it in iterator:
+
+            # Precompute full enriched item factors Z = V + Σ_f X_f W_f
+            Z_full = self._compose_Z(self.V, features)
 
             # (1) Update user factors
             for u in range(m):
                 # Items that user u has rated
-                idx = mask[u]
+                idx = user_items[u]
                 # Skip users with no ratings
-                if not np.any(idx):
+                if idx.size == 0:
                     continue
 
-                # Enrich item factors for rated items (nu, k)
-                Z = self._enrich_item_factors_with_features(
-                    np.where(idx)[0],
-                    features
-                    )
+                # Take enriched item factors for items rated by user u
+                Z_u = Z_full[idx]
 
                 # Compute residuals for user u after removing biases and mean
-                r = R[u, idx] - (self.mu + self.b_u[u] + self.b_i[idx])
-                A = Z.T @ Z + (self.lambda_u + EPS) * I
-                b = Z.T @ r
+                r_u = R[u, idx] - (self.mu + self.b_u[u] + self.b_i[idx])
+                A = Z_u.T @ Z_u + (self.lambda_u + EPS) * I
+                b = Z_u.T @ r_u
                 self.U[u] = cholesky_solve(A, b)
 
                 # Update user bias (ridge update, closed-form)
-                denom = idx.sum() + self.lambda_bu + EPS
-                pred_wo_bu = (Z @ self.U[u]) + self.mu + self.b_i[idx]
+                denom = idx.size + self.lambda_bu + EPS
+                pred_wo_bu = (Z_u @ self.U[u]) + self.mu + self.b_i[idx]
                 self.b_u[u] = float(np.sum(R[u, idx] - pred_wo_bu) / denom)
 
             # (2) Update item factors
             for i in range(n):
                 # Users that rated item i
-                idx = mask[:, i]
+                idx = item_users[i]
                 # Skip items with no ratings
-                if not np.any(idx):
+                if idx.size == 0:
                     continue
 
                 # Take user factors for users who rated item i
@@ -399,29 +445,28 @@ class ALS:
 
                 # Compute residuals for item i after removing biases and mean
                 r = R[idx, i] - (self.mu + self.b_u[idx] + self.b_i[i])
-                
+
                 # Regularization term for item i
                 reg_i = lambda_v_i[i] + EPS
-                
+
                 # Add Laplacian term if activated
                 if use_graph:
                     reg_i += float(self.alpha) * float(D[i])
-
                 A = U_i.T @ U_i + reg_i * I
                 b = U_i.T @ r
                 if use_graph:
                     b += float(self.alpha) * (self.S[i] @ self.V)
-                
+
                 # Update item factor by solving the linear system
                 self.V[i] = cholesky_solve(A, b)
 
                 # Update item bias (ridge update, closed-form)
-                denom = idx.sum() + lambda_bi_i[i] + EPS
+                denom = idx.size + lambda_bi_i[i] + EPS
                 pred_wo_bi = (U_i @ self.V[i]) + self.mu + self.b_u[idx]
                 self.b_i[i] = float(np.sum(R[idx, i] - pred_wo_bi) / denom)
 
             if (features) and ((it % self.update_w_every == 0) or (it == self.n_iters - 1)):
-                # Remove genre contribution from residuals: data - (mu + bu + bi + U@V^T)
+                # Remove feature contribution from residuals: data - (mu + bu + bi + U@V^T)
                 r_obs = R[rows_u, rows_i] - (self.mu + self.b_u[rows_u] + self.b_i[rows_i])
                 r_obs = r_obs - np.sum(self.U[rows_u] * self.V[rows_i], axis=1)
 
@@ -456,11 +501,8 @@ class ALS:
                     self.W[name] = vec.reshape(d, k)
 
             # (4) Update global mean μ
-            Z_rows = self._enrich_item_factors_with_features(
-                rows_i,
-                features
-                )
-            pred_wo_mu = (np.sum(self.U[rows_u] * Z_rows, axis=1) 
+            Z_full = self._compose_Z(self.V, features)
+            pred_wo_mu = (np.sum(self.U[rows_u] * Z_full[rows_i], axis=1) 
                           + self.b_u[rows_u] + self.b_i[rows_i])
             self.mu = float(np.mean(R[rows_u, rows_i] - pred_wo_mu))
             
@@ -473,16 +515,23 @@ class ALS:
             self.history["V_norm"].append(float(np.linalg.norm(self.V)))
             self.history["bu_norm"].append(float(np.linalg.norm(self.b_u)))
             self.history["bi_norm"].append(float(np.linalg.norm(self.b_i)))
+            
+            # Early stopping
+            if tol is not None and it + 1 >= min_iters and self._converged(tol):
+                if verbose > 0:
+                    logger.info(f"Early stopping at iter {it+1}; ΔRMSE ≤ {tol:.3g}")
+                break
 
-        logger.info(f"ALS training finished. "
-                    f"Final train RMSE: {self.history['train_rmse'][-1]:.4f}")
+        if verbose > 0:
+            logger.info(f"ALS training finished. "
+                        f"Final train RMSE: {self.history['train_rmse'][-1]:.4f}")
 
         return self
 
 
     def predict(
         self,
-        features: Dict[str, np.ndarray] | None = None
+        features: dict[str, np.ndarray] | None = None
         ) -> np.ndarray:
         """
         Compute the completed rating matrix R̂.
