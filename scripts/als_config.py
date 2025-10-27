@@ -1,8 +1,62 @@
+"""
+Typed configuration objects for the ALS matrix-factorization model.
+
+This module defines small dataclasses that hold validated configuration for
+ALS matrix-factorization recommender.
+
+## Public API:
+
+- `CoreConfig`     : latent factors/iterations and core L2 regularization
+- `BiasesConfig`   : user/item bias regularization
+- `GraphConfig`    : Laplacian regularization (with `GraphSimConfig`)
+- `ALSConfig`      : a simple container grouping the above
+
+## Typical usage:
+
+```python
+from scripts.als_config import (
+    ALSConfig, CoreConfig, BiasesConfig, GraphConfig, GraphSimConfig
+    )
+from scripts.als import ALS
+
+cfg = ALSConfig(
+    core=CoreConfig(
+        n_factors=50,
+        n_iters=20,
+        lambda_u=10.0,
+        lambda_v=10.0,
+        pop_reg_mode="inverse_sqrt",
+        random_state=42,
+        update_w_every=5,
+    ),
+    biases=BiasesConfig(
+        lambda_bu=5.0,
+        lambda_bi=5.0
+    ),
+    graph=GraphConfig(
+        alpha=0.5,
+        sim=GraphSimConfig(
+            source="feature",
+            feature_name="genres",
+            metric="cosine",
+            topk=100,
+            eps=1e-5,
+        ),
+    ),
+)
+
+model = ALS(
+    lambda_w={"genres": 5.0, "years": 10.0},
+    config=cfg
+)
+"""
+
 from dataclasses import dataclass, field
 from typing import Literal
 
 @dataclass
 class CoreConfig:
+    """Configuration for core ALS matrix factorization."""
     n_factors: int
     n_iters: int
     lambda_u: float
@@ -13,12 +67,13 @@ class CoreConfig:
 
 @dataclass
 class BiasesConfig:
+    """Configuration for user/item bias regularization."""
     lambda_bu: float | None = None
     lambda_bi: float | None = None
 
 @dataclass
 class GraphSimConfig:
-    # how to build the similarity graph
+    """Configuration for item-item similarity graph."""
     source: Literal["feature", "precomputed"] = "feature"
     feature_name: str = "genres"          # which feature to use if source="feature"
     metric: Literal["cosine"] = "cosine"  # keeping it simple for now
@@ -27,42 +82,14 @@ class GraphSimConfig:
 
 @dataclass
 class GraphConfig:
+    """Configuration for graph Laplacian regularization."""
     alpha: float = 0.0                    # laplacian strength
     sim: GraphSimConfig | None = None     # None ⇒ no similarity graph
 
 @dataclass
 class ALSConfig:
+    """Top-level configuration for ALS matrix factorization."""
     core: CoreConfig
-    # ⚠️ nested dataclasses must use default_factory (NOT plain defaults)
+    # nested dataclasses must use default_factory (NOT plain defaults)
     biases: BiasesConfig = field(default_factory=BiasesConfig)
     graph: GraphConfig = field(default_factory=GraphConfig)
-
-def config_from_legacy_params(params: dict) -> ALSConfig:
-    core = CoreConfig(
-        n_factors=int(params.get("n_factors")),
-        n_iters=int(params.get("n_iters")),
-        lambda_u=float(params.get("lambda_u")),
-        lambda_v=float(params.get("lambda_v")),
-        pop_reg_mode=params.get("pop_reg_mode"),
-        random_state=int(params.get("random_state", 42)),
-        update_w_every=int(params.get("update_w_every", 5)),
-    )
-    biases = BiasesConfig(
-        lambda_bu=float(params["lambda_bu"]) if params.get("lambda_bu") is not None else None,
-        lambda_bi=float(params["lambda_bi"]) if params.get("lambda_bi") is not None else None,
-    )
-
-    alpha = float(params.get("alpha", 0.0) or 0.0)
-    sim: GraphSimConfig | None = None
-    # only build a sim config if we actually have graph params
-    if alpha > 0.0 and params.get("S_topk") is not None:
-        sim = GraphSimConfig(
-            source="feature",
-            feature_name="genres",
-            metric="cosine",
-            topk=int(params.get("S_topk")),
-            eps=float(params.get("S_eps", 1e-8)),
-        )
-
-    graph = GraphConfig(alpha=alpha, sim=sim)
-    return ALSConfig(core=core, biases=biases, graph=graph)
