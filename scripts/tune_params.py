@@ -1,40 +1,44 @@
 """
-ALS hyperparameter tuning with Optuna on frozen CV folds.
+ALS hyperparameter tuning with Optuna on frozen cross-validation folds.
 
-This module tunes an ALS MF recommender by running an Optuna study over a
-defined search space. To change the search space, modify the the global
-constants in the beginning of the file. The module supports early stopping,
-pruning unpromising trials, and checkpointing intermediate results. It is
-supposed to be run on precomputed folds saved in .npz format. If you don't have
-such folds, use scripts/create_folds.py to create them.
+This module tunes an ALS matrix-factorization recommender by running an Optuna
+study over a configurable search space. It supports:
+- early stopping inside ALS (currently enabled so n_iters is set to a constant),
+- pruning of under-performing trials via Optuna,
+- periodic checkpointing of artifacts during long studies.
 
-Public API:
-----------
-- run_tuning(...)         : runs the study and writes artifacts.
-- make_checkpoint_cb(...) : periodic saver for long studies.
-- save_all_artifacts(...) : exports CSV/plots/JSON from a finished study.
+You must provide precomputed CV folds saved as a .npz file. If you don't have
+them yet, see `scripts/create_folds.py`.
 
-Results (under: <out_dir>/tuning):
-----------
-  ├─ <study_name>_trials.csv         # Trials with params, value, and metadata
-  ├─ <study_name>_summary.json       # Study summary + best trial metadata
-  ├─ <study_name>_best_params.json   # Best trial params + value + user_attrs
-  └─ plots/
-       ├─ history.html               # Optimization history
-       ├─ intermediate_values.html   # Per-trial intermediate fold RMSEs
-       ├─ param_importances.html     # (If enough trials) Param importances
-       ├─ slice.html                 # Slices for key parameters
-       ├─ parallel_coordinates.html  # Parallel coords for key parameters
-       └─ contour_*.html             # A few pairwise contours for key params
+## Public API
 
-Typical usage
--------------
+- `run_tuning(...)`         — run the study and write artifacts to disk.
+- `make_checkpoint_cb(...)` — build a periodic saver callback for long studies.
+- `save_all_artifacts(...)` — export CSV/JSON/HTML plots from a finished study.
+
+## Artifacts (written under: `<out_dir>/tuning`)
+
+- `<study_name>_trials.csv`        — all trials with params, values, user_attrs
+- `<study_name>_summary.json`      — study summary and best-trial metadata
+- `<study_name>_best_params.json`  — best params + value + user_attrs
+- `plots/`
+    - `history.html`                — optimization history
+    - `intermediate_values.html`    — per-trial intermediate (fold) values
+    - `param_importances.html`      — parameter importances (if enough trials)
+    - `slice.html`                  — parameter slices
+    - `parallel_coordinates.html`   — parallel coordinates for key params
+    - `contour_*.html`              — a few pairwise contour plots
+
+## Typical usage
+
+```python
 from scripts.tune_params import run_tuning
+import numpy as np
 
 R_PATH = "data/ratings.npy"
 FOLDS_PATH = "artifacts/folds/entrywise_5_fold_seed_42.npz"
 
-# Example side features (item-level)
+# Example item side features
 genres = np.load("data/genres.npy")
 years  = np.load("data/years.npy").reshape(-1, 1)
 features = {"genres": genres, "years": years}
@@ -331,11 +335,7 @@ def _params_to_lambda_w(
     Returns:
         Dictionary mapping feature names to their corresponding λ_w values.
     """
-    out: Dict[str, float] = {}
-    for name in features.keys():
-        out[name] = float(params.get(f"lambda_w_{name}", 0.0))
-
-    return out
+    return {name: float(params.get(f"lambda_w_{name}", 0.0)) for name in features}
 
 
 def _cv_score_single_trial(
