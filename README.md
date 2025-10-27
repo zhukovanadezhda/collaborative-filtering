@@ -4,7 +4,6 @@ Imagine building a **recommendation system that predicts what movies you might l
 
 This is a classic problem in data science known as **collaborative filtering**. It looks for patterns in user behavior and item characteristics to infer preferences, even when direct ratings are sparse. This repository contains a project that implements this kind of model using **matrix factorization techniques**, to predict user-item ratings in a sparse matrix.
 
----
 ## 1. Problem Statement
 
 We aim to predict unobserved user–item ratings in a sparse matrix $R \in \mathbb{R}^{m \times n}$, where each entry $R_{ui}$ is the rating given by user $u$ to item $i$.
@@ -23,7 +22,6 @@ $$
 }.
 $$
 
----
 
 ## 2. Our solution
 
@@ -75,22 +73,26 @@ $$
 
 where:
 
-- $\textcolor{teal}{\text{User/item shrinkage } (\lambda_u, \lambda_{v,i})}$
+- $\textcolor{teal}{\text{User or item shrinkage } (\lambda_u, \lambda_{v,i})}$
   Standard $L_2$ control, but item regularization optionally adapts to popularity of the item $i$:
+
 $$
   \lambda_{v,i} = \frac{\lambda_v}{\sqrt{c_i + 1}},
   \quad
   c_i = |{u : (u,i)\in\Omega}|.
 $$
+
 - $\textcolor{olive}{\text{Feature projections } (\lambda_{w_f})}$
   Penalize large deviations of learned feature embeddings.
 - $\textcolor{brown}{\text{Bias regularization } (\lambda_{b_u}, \lambda_{b_i})}$
   Control overfitting of user/item biases.
 - $\textcolor{purple}{\text{Item similarity } (\alpha \mathrm{Tr}(V^\top L V))}$
   Enforces smoothness between similar items using a Laplacian graph ($L = D - S$):
+
 $$
   \mathrm{Tr}(V^\top L V) = \frac{1}{2} \sum_{i,j} S_{ij}|V_i - V_j|^2,
 $$
+
   where $S$ encodes cosine similarity between items derived from features (e.g. genres).
 
 Even though the overall objective is non-convex, it is convex with respect to each matrix when fixing the others, and this has a closed-form solution. Therefore, we use an Alternating Least Squares (ALS) approach to optimize the parameters iteratively.
@@ -136,7 +138,6 @@ $$
 
 This alternating scheme converges quickly (typically <10 iterations with early stopping).
 
----
 
 ## 3. Hyperparameter Tuning
 
@@ -166,8 +167,6 @@ The following hyperparameters were tuned:
 **Regularization mode:** inverse-sqrt popularity scaling
 
 > The best model combined feature-based item embeddings, graph regularization, and popularity-aware item shrinkage, suggesting that integrating side information improves generalization.
-
----
 
 ## 4. Ablation Study
 
@@ -211,8 +210,6 @@ However, even this small effect does not pass the significance threshold ($\alph
 <p align="center">
   <em>Fig. 1: (a) Test RMSE by variant; (b) Training time by variant; (c) Test RMSE per item-popularity bin (mean ± std across folds).</em>
 </p>
-
----
 
 ## 6. Conclusion
 
