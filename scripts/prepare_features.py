@@ -47,10 +47,7 @@ from __future__ import annotations
 from typing import Dict, Any, Mapping, Literal
 import numpy as np
 
-
-Method = Literal["none", "row_l1", "row_l2", "col_zscore", "col_minmax"]
-Impute = Literal["none", "col_median"]
-
+# Global constants
 DEFAULT_DTYPE = "float32"
 DEFAULT_EPS = 1e-8
 
@@ -133,9 +130,9 @@ def _col_minmax(X: np.ndarray, eps: float) -> np.ndarray:
 
 def normalize_feature(
     X: np.ndarray,
-    method: Method = "none",
+    method: str = "none",
     *,
-    impute: Impute = "none",
+    impute: str = "none",
     eps: float = DEFAULT_EPS,
     dtype: str = DEFAULT_DTYPE,
     copy: bool = True,
@@ -162,6 +159,13 @@ def normalize_feature(
     Returns:
             Normalized feature matrix with dtype `dtype`.
     """
+
+    # Raise error if uncorrect method or impute
+    if method not in {"none", "row_l1", "row_l2", "col_zscore", "col_minmax"}:
+        raise ValueError(f"Unknown method '{method}'.")
+    if impute not in {"none", "col_median"}:
+        raise ValueError(f"Unknown impute '{impute}'.")
+
     # Prepare input
     X = _as_2d(X)
     X = _copy_if(X, copy)
@@ -190,8 +194,8 @@ def normalize_feature(
 def normalize_features_dict(
     features: Mapping[str, np.ndarray],
     *,
-    method: Method = "none",
-    impute: Impute = "none",
+    method: str = "none",
+    impute: str = "none",
     eps: float = DEFAULT_EPS,
     dtype: str = DEFAULT_DTYPE,
     copy: bool = True,
