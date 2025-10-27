@@ -205,6 +205,9 @@ However, none of these effects pass the significance threshold ($\alpha = 0.05$ 
   <img src="assets/time_bar.png" width="29%" />
   <img src="assets/bins_grouped_bars.png" width="37.5%" />
 </p>
+<p align="center">
+  <em>Fig. 1: (a) Test RMSE by variant; (b) Training time by variant; (c) Test RMSE per item-popularity bin (mean ± std across folds).</em>
+</p>
 
 ---
 
