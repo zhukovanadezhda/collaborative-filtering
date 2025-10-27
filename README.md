@@ -181,7 +181,7 @@ Since the best model combined all available components, to better understand the
 | **only_years**         | Keep only year features           | $λ_{W_{genres}}=0$       |
 | **no_graph**           | Disable Laplacian regularization  | $α=0$                           |
 | **graph_feature=year** | Graph built from year similarity  | replace source feature for similarity computation        |
-| **no_pop_reg**         | Uniform item regularization       | $pop\_reg\_mode=None$             |
+| **no_pop_reg**         | Uniform item regularization       | pop_reg_mode=None            |
 
 All variants were evaluated on the same folds. The main metric is Test RMSE, complemented with per-popularity-bin RMSE to assess cold-item performance. We also report paired sign-test p-values against the baseline as well as FDR-corrected p-values to account for multiple comparisons.
 
@@ -201,9 +201,9 @@ The most visible effect appears when side features are removed: without genres a
 However, none of these effects pass the significance threshold ($\alpha = 0.05$ after FDR correction), so they should be interpreted as simple tendencies rather than definitive conclusions. Increasing the number of folds or seeds or implementing nested cross-validation would likely improve statistical power and make these patterns clearer.
 
 <p align="center">
-  <img src="assets/rmse_bar.png" width="30%" />
-  <img src="assets/time_bar.png" width="30%" />
-  <img src="assets/bins_grouped_bars.png" width="39%" />
+  <img src="assets/rmse_bar.png" width="29%" />
+  <img src="assets/time_bar.png" width="29%" />
+  <img src="assets/bins_grouped_bars.png" width="37.5%" />
 </p>
 
 ---
