@@ -1,11 +1,98 @@
 # Collaborative filtering for Recommendation Systems using Matrix Factorization
 
-Imagine building a **recommendation system that predicts what movies you might like based on your past ratings and those of similar users**. Intuitively, this involves filling in a large matrix where rows represent users, columns represent movies, and the entries are ratings. However, most of this matrix is empty because users only rate a small fraction of movies. So how do we predict those missing ratings knowing that we have very little data for many users and items?
+<details> <summary><h2>👉 TL;DR</h2> (click to expand)</summary>
+ 
+> This project explores how matrix factorization (MF), enhanced with side information, can improve movie recommendations from sparse rating data. We trained an MF model that learns latent user 👤 and item 🎬 representations being guided by metadata such as genres 🎞️ and release years 📅.
+> 
+> Our best configuration reached an RMSE of ≈ 0.86, and a structured hyperparameter tuning followed by an ablation study revealed that:
+> 
+> - 👍 Removing side features degrades performance (+0.22 RMSE), confirming that metadata encode structure the latent factors alone cannot capture.
+> - 👍 Genre and year features are complementary, each adding small but consistent gains.
+> - 👎 Graph regularization and popularity-aware shrinkage show negligible impact in this setup.
+> 
+> While none of these effects reach statistical significance (given the limited folds), the findings suggest that simple, well-regularized models can remain interpretable, stable, and competitive.
+> Beyond accuracy, the focus is on building a clean, reproducible workflow designed to serve as a solid baseline for future recommender projects.
+
+</details>
+
+
+<details> <summary><h2>👉 Run the code</h2> (click to expand)</summary>
+
+### ⚙️ Overview
+
+This project follows a **four-stage pipeline**:
+
+1️⃣ **Create & freeze folds** - build reproducible train/validation splits  
+2️⃣ **Prepare & normalize features** - process metadata such as genres or years  
+3️⃣ **Tune hyperparameters** - run Optuna to find the best configuration  
+4️⃣ **Evaluate & ablate** - benchmark and interpret model variants  
+
+To reproduce everything end-to-end, simply run:
+
+```bash
+bash scripts/run_all.sh
+```
+This script executes all four stages in sequence, reproducing the full experiment with the default configuration.
+
+### ⚙️ Run stages separately
+
+Each module can also be executed independently with your own parameters:
+
+**1. Create folds**
+
+```bash
+python -m scripts.create_folds \
+  --input data/ratings.npy \
+  --output artifacts/folds/entrywise_folds_seed_<SEED>.npz \
+  --n_splits <K> \
+  --seed <SEED>
+```
+
+**2. Prepare features**
+
+```bash
+python -m scripts.prepare_features \
+  --genres_path data/genres.npy \
+  --years_path data/years.npy \
+  --genres_norm_method <row_l1|col_zscore|none> \
+  --years_norm_method <row_l1|col_zscore|none> \
+  --output_path data/features.npz
+```
+
+**3. Tune hyperparameters**
+
+```bash
+python -m scripts.tune_params \
+  --R_path data/ratings.npy \
+  --folds_path artifacts/folds/entrywise_folds_seed_<SEED>.npz \
+  --features_path data/features.npz \
+  --study_name <study_name> \
+  --n_trials <N> \
+  --seed <SEED>
+```
+
+**4. Evaluate or ablate models**
+
+```bash
+python -m scripts.evaluate_models \
+  --R_path data/ratings.npy \
+  --folds_path artifacts/folds/entrywise_folds_seed_<SEED>.npz \
+  --best_params_path results/tuning/<study_name>_best_params.json \
+  --features_path data/features.npz \
+  --out_dir results/ablations \
+  --n_pop_bins <N_BINS>
+```
+Each of the corresponding scripts is (hopefully) well-documented, so feel free to check their internal docstrings and comments in case of any question or if you’d like to adapt them to your own setup.
+
+</details>
+
+## 1. Introduction
+
+Imagine building a **recommendation system that predicts what movies you might like based on your past ratings and those of similar users**. Intuitively, this involves filling in a large matrix where rows represent users, columns represent movies, and the entries are ratings. However, most of this matrix is empty because users only rate a small fraction of movies. So, how do we predict those missing ratings knowing that we have very little data for many users and items?
 
 This is a classic problem in data science known as **collaborative filtering**. It looks for patterns in user behavior and item characteristics to infer preferences, even when direct ratings are sparse. This repository contains a project that implements this kind of model using **matrix factorization techniques**, to predict user-item ratings in a sparse matrix.
 
----
-## 1. Problem Statement
+## 2. Problem Statement
 
 We aim to predict unobserved user–item ratings in a sparse matrix $R \in \mathbb{R}^{m \times n}$, where each entry $R_{ui}$ is the rating given by user $u$ to item $i$.
 Only a small subset of entries ($\Omega \subset [m] \times [n]$) is observed, making the task one of **matrix completion under sparsity**.
@@ -23,9 +110,8 @@ $$
 }.
 $$
 
----
 
-## 2. Our solution
+## 3. Our solution
 
 Our final model represents the predicted rating $\widehat{R}_{ui}$ with several low-rank matrices $U, V, W_f$ learned from data, where $U$ and $V$ capture latent user and item factors, and $W_f$ project item features into the latent space. We further extend this approach by adding bias terms.
 
@@ -49,102 +135,76 @@ where:
 - $b_u, b_i$: user and item biases
 - $k$: latent dimension
 
+
+<details markdown="1"> 
+  <summary><h3>👉 Details of different regularization terms used in the loss function</h3> (click to expand)</summary>
+
 The loss minimized over observed ratings is enriched with several regularization terms to incorporate side information. Some of these regularizations are optional and can be deactivated, but the most complete formula of the loss function is:
 
-$$
-\begin{aligned}
-\mathcal{L} &=
-\sum_{(u,i)\in \Omega}
-\bigl(R_{ui} - U_u^\top (V_i + \sum_f W_f^\top x_{i,f}) - \mu - b_u - b_i \bigr)^2 -
-\end{aligned}
-$$
-$$
-\begin{aligned}
-\textcolor{teal}{
--\lambda_u |U|_F^2 - \sum_i \lambda_{v,i} |V_i|_2^2} \textcolor{olive}{- \sum_f \lambda_{w_f} |W_f|_F^2} \textcolor{brown}{- \lambda_{b_u}|b_u|_2^2 - \lambda_{b_i}|b_i|_2^2 - 
-}
-\end{aligned}
-$$
-$$
-\begin{aligned}
-\textcolor{purple}{
--\alpha\mathrm{Tr}(V^\top L V)
-},
-\end{aligned}
-$$
+$\qquad \qquad \qquad \large \mathcal{L} = \sum_{(u,i)\in \Omega} \bigl(R_{ui} - U_u^\top (V_i + \sum_f W_f^\top x_{i,f}) - \mu - b_u - b_i \bigr)^2 -$
+
+$\qquad \qquad \qquad \large \textcolor{teal}{-\lambda_u \lVert U \rVert_F^2 - \sum_i \lambda_{v,i} \lVert V_i \rVert_2^2} \\ \textcolor{olive}{- \sum_f \lambda_{w_f} \lVert W_f \rVert_F^2} \\ \textcolor{brown}{- \lambda_{b_u} \lVert b_u \rVert_2^2 - \lambda_{b_i} \lVert b_i \rVert_2^2 -}$
+
+$\qquad \qquad \qquad \large \textcolor{purple}{-\alpha\mathrm{Tr}(V^\top L V)},$
 
 where:
 
-- $\textcolor{teal}{\text{User/item shrinkage } (\lambda_u, \lambda_{v,i})}$
-  Standard $L_2$ control, but item regularization optionally adapts to popularity of the item $i$:
-$$
-  \lambda_{v,i} = \frac{\lambda_v}{\sqrt{c_i + 1}},
-  \quad
-  c_i = |{u : (u,i)\in\Omega}|.
-$$
-- $\textcolor{olive}{\text{Feature projections } (\lambda_{w_f})}$
-  Penalize large deviations of learned feature embeddings.
-- $\textcolor{brown}{\text{Bias regularization } (\lambda_{b_u}, \lambda_{b_i})}$
-  Control overfitting of user/item biases.
-- $\textcolor{purple}{\text{Item similarity } (\alpha \mathrm{Tr}(V^\top L V))}$
-  Enforces smoothness between similar items using a Laplacian graph ($L = D - S$):
-$$
-  \mathrm{Tr}(V^\top L V) = \frac{1}{2} \sum_{i,j} S_{ij}|V_i - V_j|^2,
-$$
-  where $S$ encodes cosine similarity between items derived from features (e.g. genres).
+- $\large \textcolor{teal}{\text{User or item shrinkage } (\lambda_u, \lambda_{v,i}):}$ This is the classic $L_2$ penalty that prevents latent factors from growing arbitrarily large. It ensures that users and items with few observations don’t overfit their small amount of data. In our case, the item regularization $\lambda_{v,i}$ can optionally be scaled inversely with the item’s popularity (we trust more the popular items): $\lambda_{v,i} = \frac{\lambda_v}{\sqrt{c_i + 1}},\quad c_i = |{u : (u,i)\in\Omega}|$.
 
-Even though the overall objective is non-convex, it is convex with respect to each matrix when fixing the others, and this has a closed-form solution. Therefore, we use an Alternating Least Squares (ALS) approach to optimize the parameters iteratively.
+- $\large \textcolor{olive}{\text{Feature projections } (\lambda_{w_f}):}$ Each $W_f$ projects an item’s raw feature vector (e.g. genre, year) into the same latent space as $V_i$. The corresponding regularization penalizes large deviations, acting like a prior that discourages the feature mappings from dominating the latent representation. Intuitively, it keeps the learned feature influence “gentle” rather than letting side information completely override collaborative patterns.
 
-The updates are repeated for a fixed number of iterations, but the early stopping is implemented to reduce training time and prevent overfitting.
+- $\large\textcolor{brown}{\text{Bias regularization } (\lambda_{b_u}, \lambda_{b_i}):}$ These terms keep user and item biases (i.e., consistent rating offsets) from absorbing too much variance. Without this constraint, biases could fit individual noise, especially for users who rate few items. In practice, bias regularization improves the stability and convergence speed of ALS updates.
+
+- $\large \textcolor{purple}{\text{Item similarity } (\alpha \mathrm{Tr}(V^\top L V)):}$ This is the graph Laplacian regularization, which enforces that similar items (according to metadata) should have similar embeddings. It minimizes the smoothness term: $\mathrm{Tr}(V^\top L V) = \frac{1}{2} \sum_{i,j} S_{ij}|V_i - V_j|^2$, where $S$ encodes cosine similarity between items (e.g. shared genres). In practice, it acts like a “soft constraint” that pulls neighboring movies closer in latent space, which improves cold-item generalization when side metadata are available.
+
+</details> 
+
+Even though the global objective is non-convex, it becomes convex with respect to each parameter group when the others are fixed. This property allows an Alternating Least Squares (ALS) algorithm: at each step, one block of parameters is updated while keeping the rest constant. Each subproblem has a closed-form least-squares solution, which can be solved.
+
+In simple terms:
+
+- We alternate between updating users, items, feature projections, and biases.
+- Each update “refits” that part of the model to the residuals left by the others.
+- This process quickly drives the model toward a stationary point of the objective.
+
+The updates repeat for a fixed number of iterations, but an early-stopping mechanism is applied to halt training once the validation RMSE stops improving, avoiding overfitting and saving computation.
+
+<details markdown="1"> 
+  <summary><h3>👉 Detailed update equations</h3> (click to expand)</summary>
 
 At each iteration, we update each parameter in turn by solving the following subproblems (with Cholesky decomposition for efficiency):
 
-$$
-U_u \leftarrow
-\arg\min_x
-|r_u - Z_u x|_2^2 + \lambda_u |x|_2^2,
-$$
-$$
-V_i \leftarrow
-\arg\min_x
-|r_i - U_i x|_2^2 + \lambda_{v,i}|x|_2^2 + \alpha \psi_i(x),
-$$
-$$
-W_f \leftarrow
-\arg\min_x
-\sum_{(u,i)\in\Omega}
-(R_{ui} - U_u^\top (V_i + \sum_{f' \ne f} W_{f'}^\top x_{i,f'}) - \mu - b_u - b_i - U_u^\top x_{i,f} x) ^2 + \lambda_{w_f} |x|_F^2,
-$$
-$$
-b_u \leftarrow
-\frac{\sum_{i: (u,i)\in\Omega}
-(R_{ui} - U_u^\top (V_i + \sum_f W_f^\top x_{i,f}) - \mu - b_i)}
-{|\{i: (u,i)\in\Omega\}| + \lambda_{b_u}},
-$$
-$$
-b_i \leftarrow
-\frac{\sum_{u: (u,i)\in\Omega}
-(R_{ui} - U_u^\top (V_i + \sum_f W_f^\top x_{i,f}) - \mu - b_u)}
-{|\{u: (u,i)\in\Omega\}| + \lambda_{b_i}},
-$$
-$$
-\mu \leftarrow
-\frac{1}{|\Omega|}
-\sum_{(u,i)\in\Omega}
-(R_{ui} - U_u^\top (V_i + \sum_f W_f^\top x_{i,f}) - b_u - b_i).
-$$
+$\qquad \large U_u \leftarrow \arg\min_x \lVert r_u - Z_u x \rVert_2^2 + \lambda_u \lVert x \rVert_2^2,$
 
-This alternating scheme converges quickly (typically <10 iterations with early stopping).
+$\qquad \large V_i \leftarrow \arg\min_x \lVert r_i - U_i x \rVert_2^2 + \lambda_{v,i}\lVert x \rVert_2^2 + \alpha \psi_i(x),$
 
----
+$\qquad \large W_f \leftarrow \arg\min_x \sum_{(u,i)\in\Omega} (R_{ui} - U_u^\top (V_i + \sum_{f' \ne f} W_{f'}^\top x_{i,f'}) - \mu - b_u - b_i - U_u^\top x_{i,f} x) ^2 + \lambda_{w_f} \lVert x \rVert_F^2,$
 
-## 3. Hyperparameter Tuning
+$\qquad \large b_u \leftarrow \frac{\sum_{i: (u,i)\in\Omega} (R_{ui} - U_u^\top (V_i + \sum_f W_f^\top x_{i,f}) - \mu - b_i)} {\lVert \{i: (u,i)\in\Omega\}\rVert + \lambda_{b_u}},$
+
+$\qquad \large b_i \leftarrow \frac{\sum_{u: (u,i)\in\Omega} (R_{ui} - U_u^\top (V_i + \sum_f W_f^\top x_{i,f}) - \mu - b_u)} {\lVert \{u: (u,i)\in\Omega\}\rVert + \lambda_{b_i}},$
+
+$\qquad \large \mu \leftarrow \frac{1}{\lVert\Omega\rVert} \sum_{(u,i)\in\Omega} (R_{ui} - U_u^\top (V_i + \sum_f W_f^\top x_{i,f}) - b_u - b_i).$
+
+Each term above corresponds to solving a small, independent least-squares problem. Since all updates have closed-form solutions, the method avoids costly gradient computations, making ALS both stable and interpretable.
+
+</details> 
+
+
+## 4. Hyperparameter Tuning
 
 From our solution above, we can see that there are several hyperparameters to tune. So, once the model was implemented, we performed a hyperparameter search using Optuna with 3-fold cross-validation on the frozen folds that we created from the dataset. Each trial minimizes the mean validation RMSE across folds. We used a TPE sampler and MedianPruner, with early stopping enabled inside ALS (`es_tol = 1e−4`, `es_min_iters = 10`). The optimization ran for 150 trials.
 
-The following hyperparameters were tuned:
+**Best validation RMSE:** 0.8663  
+**Mean training iterations:** 13 (all early-stopped folds)  
+**Features used:** `genres`, `years`  
+**Graph source:** `genres` (cosine similarity)  
+**Regularization mode:** inverse-sqrt popularity scaling
 
+> The best model combined feature-based item embeddings, graph regularization, and popularity-aware item shrinkage, suggesting that integrating side information improves generalization.
 
+<details> 
+  <summary><h3>👉 Details on the hyperparameters and the used search space</h3> (click to expand)</summary>
 
 | Hyperparameter           | Description                                    | Search Space               |
 | ------------------------ | ---------------------------------------------- | -------------------------- |
@@ -159,19 +219,13 @@ The following hyperparameters were tuned:
 | `update_w_every`         | Frequency of W updates                         | [1, 60]                    |
 | `n_iters`                | Max iterations                                 | 100 (fixed because of early-stopping) |
 
-**Best validation RMSE:** 0.8663
-**Mean training iterations:** 13 (all early-stopped folds)
-**Features used:** `genres`, `years`
-**Graph source:** `genres` (cosine similarity)
-**Regularization mode:** inverse-sqrt popularity scaling
+*Table 1. Hyperparameter search space used for Optuna optimization (150 trials, 3-fold CV).*
 
-> The best model combined feature-based item embeddings, graph regularization, and popularity-aware item shrinkage, suggesting that integrating side information improves generalization.
-
----
+</details> 
 
 ## 4. Ablation Study
 
-Since the best model combined all available components, to better understand the contribution of each of them to the overall performance, we performed an ablation study by disabling or altering one component at a time and measuring the impact on performance. The variants tested are summarized in the table below:
+Since the best model combined all available components, to better understand the contribution of each of them to the overall performance, we performed an ablation study by disabling or altering one component at a time and measuring the impact on performance. All variants were evaluated on the same folds. The main metric is Test RMSE, complemented with per-popularity-bin RMSE to assess cold-item performance. We also report paired sign-test p-values against the baseline as well as FDR-corrected p-values to account for multiple comparisons. The variants tested are summarized in the table below:
 
 | Variant                         | Description                                             | Disabled / Altered Components   |
 | ------------------------------- | ------------------------------------------------------- | ------------------------------- |
@@ -183,7 +237,10 @@ Since the best model combined all available components, to better understand the
 | **graph_feature=year** | Graph built from year similarity  | replace source feature for similarity computation        |
 | **no_pop_reg**         | Uniform item regularization       | pop_reg_mode=None            |
 
-All variants were evaluated on the same folds. The main metric is Test RMSE, complemented with per-popularity-bin RMSE to assess cold-item performance. We also report paired sign-test p-values against the baseline as well as FDR-corrected p-values to account for multiple comparisons.
+*Table 2. Description of model variants tested in the ablation study and their altered components.*
+
+
+<details> <summary><h3>👉 Full results table</h3> (click to expand)</summary>
 
 | Variant               | Time |Train RMSE| Test RMSE | Cold Bin RMSE | Popular Bin RMSE | Raw p-value | FDR Corrected p-value |
 | --------------------- | ---- | -|-------- | -------------- | ----------------- | ------- | --------------------- |
@@ -195,7 +252,11 @@ All variants were evaluated on the same folds. The main metric is Test RMSE, com
 | **graph_feature=year**|42.0569 $\pm$ 1.1031 |0.7900 $\pm$ 0.0017|**0.8618 $\pm$ 0.0069**|0.9541 $\pm$ 0.0441|**0.8495 $\pm$ 0.0043**| 1.000|1.000|
 | **no_pop_reg**|47.1860 $\pm$ 16.5324|0.7900 $\pm$ 0.0017|**0.8618 $\pm$ 0.0069**|0.9541 $\pm$ 0.0441|**0.8495 $\pm$ 0.0043**| 1.000|1.000|
 
-## 5. Results and Discussion
+*Table 3. Quantitative results of the ablation study. Reported metrics are mean ± std across folds. “Cold Bin RMSE” refers to items with ≤2 ratings; “Popular Bin RMSE” to items with 15+ ratings.*
+
+</details>
+
+## 6. Results and Discussion
 
 The most visible effect appears when side features are removed: without genres and years, the test RMSE increases by about +0.22 (Fig.1 (a)), which suggests that these **metadata capture structure that the latent factors alone fail to model**. Using a single feature weakens performance: `only_genres` stays close, `only_years` drops more, meaning that **the two features look complementary rather than interchangeable**. Disabling the graph term (`no_graph`) or switching its similarity source (`graph_feature=years`) produces almost no change in RMSE, but consistently shortens training (Fig.1 (b)), because the construction of the similarity graph takes time with no visible impact on the final performance. The removing popularity-aware shrinkage (`no_pop_reg`) does not affect RMSE much either, though the idea of popularity-awareness could be further explored (here we only tested uniform vs. inverse-sqrt scaling).
 
@@ -212,9 +273,7 @@ However, even this small effect does not pass the significance threshold ($\alph
   <em>Fig. 1: (a) Test RMSE by variant; (b) Training time by variant; (c) Test RMSE per item-popularity bin (mean ± std across folds).</em>
 </p>
 
----
-
-## 6. Conclusion
+## 7. Conclusion
 
 This project implemented a recommender system based on matrix factorization, extended with graph regularization, side-feature projections, and popularity-dependent item shrinkage. The results suggest that feature-based item embeddings contribute most to predictive quality, while graph and popularity terms primarily help with stability and calibration.
 
