@@ -1,5 +1,5 @@
 """
-Entrywise K-fold splits for a ratings matrix.
+Create entry-wise K-fold splits for a ratings matrix.
 
 This module creates disjoint validation folds over the observed entries of a
 ratings matrix `R` (NaN = missing). It also provides utilities to save those
@@ -41,17 +41,26 @@ R_train, R_valid, val_idx = make_train_valid_split(R, folds, k=0)
 
 from __future__ import annotations
 
+import argparse
+import logging
 from typing import List, Tuple
 import os
 
 import numpy as np
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
 def make_entrywise_folds(
     R: np.ndarray,
     n_splits: int = 5,
     seed: int = 42,
-    shuffle: bool = True,
+    shuffle: bool = True
 ) -> List[np.ndarray]:
     """
     Build K disjoint validation splits over the observed entries of R.
@@ -177,7 +186,7 @@ def matrix_from_indices(
 def make_train_valid_split(
     R: np.ndarray,
     folds: List[np.ndarray],
-    k: int
+    k: int = 0
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Given rating matrix R and folds, build train and val matrices for fold k.
@@ -206,3 +215,85 @@ def make_train_valid_split(
     R_val = matrix_from_indices((m, n), val_idx, R.ravel()[val_idx])
 
     return R_train, R_val, val_idx
+
+
+def _parse_args() -> argparse.Namespace:
+    """
+    Parse command-line arguments.
+
+    Returns:
+        argparse.Namespace: Parsed arguments.
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            "Create entrywise K-fold splits for "
+            "a ratings matrix and save them to .npz",
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--input",
+        type=str,
+        required=True,
+        help="Path to ratings matrix (.npy); must use NaN for missing entries."
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        required=True,
+        help="Output .npz file for folds."
+    )
+    parser.add_argument(
+        "--n_splits",
+        type=int,
+        default=5,
+        help="Number of folds."
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed."
+    )
+    parser.add_argument(
+        "--no_shuffle",
+        action="store_true",
+        help="Disable shuffling before splitting."
+        )
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    """Main function to create and save entrywise K-fold splits."""
+
+    # Parse command-line arguments
+    args = _parse_args()
+
+    # Load ratings matrix
+    R = np.load(args.input)
+
+    # Create folds
+    folds = make_entrywise_folds(
+        R=R,
+        n_splits=args.n_splits,
+        seed=args.seed,
+        shuffle=not args.no_shuffle
+    )
+
+    # Create output directory if it doesn't exist
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+
+    # Save folds to .npz
+    save_folds_npz(
+        path=args.output,
+        folds=folds,
+        shape=R.shape,
+        seed=args.seed
+    )
+
+    logger.info(f"Saved {args.n_splits} folds to {args.output}")
+
+
+if __name__ == "__main__":
+    main()

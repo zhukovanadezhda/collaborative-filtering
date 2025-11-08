@@ -13,7 +13,7 @@ You must provide:
 - frozen folds produced by `scripts/create_folds.py` (an `.npz`)
 - a JSON with best params (if not available, run `scripts/tune_params.py` first)
 - optional item features used by ALS (e.g., genres, years), as a dict of
-  name -> ndarray
+name -> ndarray
 
 ## What gets evaluated
 
@@ -77,11 +77,14 @@ csv_path, json_path = run_ablation(
 
 print("Ablations CSV:", csv_path)
 print("Ablations JSON:", json_path)
+```
 """
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
+import logging
 from typing import Dict, Any, List, Tuple, Optional
 from pathlib import Path
 import json
@@ -91,6 +94,7 @@ import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 from scripts.als import ALS
 from scripts.create_folds import load_folds_npz, make_train_valid_split
@@ -107,6 +111,13 @@ from scripts.tune_params import (
 N_POP_BINS: int = 5
 POP_BIN_STRATEGY: str = "quantile"  # ["quantile", "uniform"]
 
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+)
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class AblationResultRow:
@@ -121,7 +132,10 @@ class AblationResultRow:
     target_n_iters: int
     es_tol: float
     es_min_iters: int
-    rmse_bins: Dict[str, float]
+    rmse_bins_mean: Dict[str, float]
+    rmse_bins_std: Dict[str, float]
+    rmse_train_mean: float
+    rmse_train_std: float
     params: Dict[str, Any]
     p_raw: Optional[float] = None
     p_fdr: Optional[float] = None
@@ -145,28 +159,54 @@ def _popularity_bins_from_R(
         edges: (n_bins + 1,) array of bin edges.
     """
     counts = np.sum(~np.isnan(R), axis=0).astype(float)
+    if counts.size == 0:
+        raise ValueError("R has no observed entries; cannot bin popularity.")
+
+    cmin = max(1, int(np.nanmin(counts)))
+    cmax = int(np.nanmax(counts))
 
     if strategy == "quantile":
-        qs = np.linspace(0, 1, n_bins + 1)
-        edges = np.quantile(counts, qs)
+        # Raw quantile edges (including endpoints)
+        q = np.linspace(0.0, 1.0, n_bins + 1)
+        edges = np.quantile(counts, q)
+        # Internal raw boundaries (exclude the very first and last)
+        internals = edges[1:-1]
     elif strategy == "uniform":
-        edges = np.linspace(
-            float(np.min(counts)), float(np.max(counts)), n_bins + 1
-            )
+        # Uniform in count space
+        internals = np.linspace(cmin, cmax, n_bins + 1)[1:-1]
     else:
         raise ValueError(f"Unknown popularity binning strategy '{strategy}'")
 
-    # Ensure strictly increasing edges to avoid degenerate bins
-    edges = np.array(edges, dtype=float)
-    for i in range(1, len(edges)):
-        if edges[i] <= edges[i - 1]:
-            edges[i] = edges[i - 1] + 1e-9
+    # Build integer lower bounds L = [1, 2, 4, ...]
+    lowers: List[int] = [cmin]
 
-    # Assign bins (rightmost inclusive)
-    item_bin = np.clip(np.searchsorted(
-        edges, counts, side="right") - 1, 0, n_bins - 1
-                       )
-    return item_bin.astype(int), edges
+    for idx, thr in enumerate(internals, start=1):
+        if idx == 1:
+            # First bin starts at ceil(thr)
+            nxt = int(np.ceil(thr))
+        else:
+            # Subsequent bins start at floor(thr) + 1 to avoid overlap
+            nxt = int(np.floor(thr)) + 1
+
+        # Enforce strict increase (no empty/overlapping bins)
+        if nxt <= lowers[-1]:
+            nxt = lowers[-1] + 1
+        lowers.append(nxt)
+
+    # If we accidentally ran past cmax, keep it;
+    # the last bin will still be valid (it’s "+inf").
+    lowers = np.array(lowers[:n_bins], dtype=int)
+    if len(lowers) < n_bins:
+        # Pad (rare) to guarantee n_bins; keep increasing by 1
+        while len(lowers) < n_bins:
+            lowers = np.append(lowers, lowers[-1] + 1)
+
+    # Assign bins using right-open intervals
+    aug = np.append(lowers, np.inf)
+    item_bin = np.searchsorted(aug, counts, side="right") - 1
+    item_bin = np.clip(item_bin, 0, n_bins - 1).astype(int)
+
+    return item_bin, lowers
 
 
 def _split_val_indices_by_popularity(
@@ -203,7 +243,15 @@ def _eval_variant_cv(
     es_min_iters: int,
     convergence_curves: Dict[str, List[List[float]]],
     verbose_fit: int = 0,
-) -> Tuple[List[float], List[float], List[Dict[str, float]], List[int]]:
+) -> (
+    Tuple[
+        List[float],                # fold_rmse
+        List[float],                # fold_time
+        List[Dict[str, float]],     # fold_bin_rmse
+        List[int],                  # fold_iters
+        List[float]                 # fold_train_rmse
+    ]
+):
     """Evaluate a fixed-parameter model across CV folds and record convergence.
 
     Args:
@@ -224,6 +272,7 @@ def _eval_variant_cv(
         fold_time: List of training times per fold.
         fold_bin_rmse: List of dicts of bin-wise RMSE per fold.
         fold_iters: List of number of iterations per fold.
+        fold_train_rmse: List of final training RMSE per fold.
     """
     # Normalize params to data
     params = _normalize_params(dict(params), R.shape, list(features.keys()))
@@ -237,7 +286,7 @@ def _eval_variant_cv(
         for name in features.keys()
         }
 
-    fold_rmse, fold_time, fold_bin_rmse, fold_iters = [], [], [], []
+    fold_rmse, fold_time, fold_bin_rmse, fold_iters, fold_train_rmse = [], [], [], [], []
 
     for i, _ in enumerate(folds):
         R_train, R_valid, val_idx = make_train_valid_split(R, folds, i)
@@ -259,7 +308,13 @@ def _eval_variant_cv(
             list(model.history.get("train_rmse", []))
         )
 
+        # Training RMSE curve
+        train_curve = model.history.get("train_rmse", [])
+
         # Overall fold metrics
+        fold_train_rmse.append(
+            float(train_curve[-1]) if len(train_curve) > 0 else float("nan")
+            )
         fold_rmse.append(_rmse_on_indices(R_valid, R_hat, val_idx))
         fold_time.append(t1 - t0)
         fold_iters.append(len(model.history.get("train_rmse", [])))
@@ -273,7 +328,7 @@ def _eval_variant_cv(
             for b, idx_b in enumerate(bin_indices)
         })
 
-    return fold_rmse, fold_time, fold_bin_rmse, fold_iters
+    return fold_rmse, fold_time, fold_bin_rmse, fold_iters, fold_train_rmse
 
 
 def _aggregate_convergence(curves: List[List[float]]) -> Dict[str, Any]:
@@ -301,29 +356,38 @@ def _aggregate_convergence(curves: List[List[float]]) -> Dict[str, Any]:
         "iters": list(range(1, maxlen + 1)),
         "rmse_mean": np.nanmean(arr, axis=0).tolist(),
         "rmse_std": np.nanstd(arr, axis=0).tolist(),
-        "n_folds": len(curves),
+        "n_folds": len(curves)
     }
 
 
-def _aggregate_bins_mean(
+def _aggregate_bins_stats(
     fold_bin_rmse: List[Dict[str, float]]
-) -> Dict[str, float]:
+) -> Tuple[Dict[str, float], Dict[str, float]]:
     """Average bin-wise RMSE across folds.
 
     Args:
         fold_bin_rmse: List of dicts of bin-wise RMSE per fold.
 
     Returns:
-        Dict of mean bin-wise RMSE across folds.
+        mean_out: Dict of mean RMSE per bin.
+        std_out: Dict of stddev RMSE per bin.
     """
     # Handle empty case
     if not fold_bin_rmse:
-        return {}
+        return {}, {}
 
-    # Get all bin keys
+    # Assume all dicts share the same keys
+    mean_out: Dict[str, float] = {}
+    std_out: Dict[str, float] = {}
     keys = sorted(fold_bin_rmse[0].keys())
-    
-    return {k: float(np.nanmean([d[k] for d in fold_bin_rmse])) for k in keys}
+    for k in keys:
+        vals = np.array([d[k] for d in fold_bin_rmse], dtype=float)
+        mean_out[k] = float(np.nanmean(vals))
+        std_out[f"rmse_pop_std_{k.replace('rmse_pop_', '')}"] = (
+            float(np.nanstd(vals, ddof=1)) if len(vals) > 1 else 0.0
+        )
+
+    return mean_out, std_out
 
 
 def _sign_test_paired(x: List[float], y: List[float]) -> float:
@@ -456,158 +520,349 @@ def _variant_grid(
 
 
 def _safe_savefig(fig, path: Path) -> None:
-    """Safely save a Matplotlib figure to PNG and close it.
-
-    Args:
-        fig: Matplotlib figure.
-        path: Path to save the figure.
-    """
+    """Safely save a Matplotlib figure to PNG and close it."""
     try:
         fig.savefig(path.as_posix(), dpi=160, bbox_inches="tight")
     finally:
         plt.close(fig)
 
 
-def _save_comparative_plots(df: pd.DataFrame, out_dir: Path) -> None:
-    """Create comparative PNG plots from the ablation summary DataFrame.
-    Produces:
-      - rmse_bar.png
-      - time_bar.png
-      - rmse_vs_time.png
-      - bins_heatmap.png
-      - bins_grouped_bars.png
-    """
-    plots_dir = out_dir / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
+def _plots_dir(out_dir: Path) -> Path:
+    """Ensure and return the plots/ subdirectory under out_dir."""
+    d = out_dir / "plots"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
-    def _baseline_index(frame: pd.DataFrame) -> Optional[int]:
-        if "full" in frame["variant"].values:
-            return int(np.where(frame["variant"].values == "full")[0][0])
+
+def _grid(ax) -> None:
+    """Add a light grid to the given Axes."""
+    ax.grid(True, linewidth=0.6, linestyle=":", alpha=0.35, zorder=0)
+
+
+def _baseline_index(frame: pd.DataFrame) -> Optional[int]:
+    """Return the index of the 'full' baseline variant, if present."""
+    if "full" in frame["variant"].values:
+        return int(np.where(frame["variant"].values == "full")[0][0])
+    return None
+
+
+def _figure_for_n(
+    n: int, h: float = 5.0, min_w: float = 7.0, per: float = 0.8
+    ) -> tuple:
+    """Return (fig, ax) with a width that scales mildly with n bars."""
+    return plt.subplots(figsize=(max(min_w, per * n), h))
+
+
+def _order_by_overall_rmse(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of df ordered by ascending overall rmse_mean."""
+    return df.sort_values("rmse_mean").reset_index(drop=True)
+
+
+def _bin_mean_cols(df: pd.DataFrame) -> list[str]:
+    """Return sorted list of per-popularity-bin mean RMSE column names."""
+    cols = [c for c in df.columns if c.startswith("rmse_pop_") and "_std_" not in c]
+    return sorted(cols, key=lambda c: int(c.replace("rmse_pop_", "")))
+
+
+def _bin_std_cols(bin_means: list[str]) -> list[str]:
+    """Return corresponding per-popularity-bin stddev RMSE column names."""
+    return [f"rmse_pop_std_{c.replace('rmse_pop_', '')}" for c in bin_means]
+
+
+def _read_bin_edges(out_dir: Path, k_bins: int) -> Optional[np.ndarray]:
+    """Read popularity bin lower bounds."""
+    meta_path = out_dir / "ablations.json"
+    if not meta_path.exists():
         return None
+    try:
+        meta = json.loads(meta_path.read_text())
+        edges = meta.get("pop_bin_edges", None)
+        if edges is not None and len(edges) == k_bins:
+            return np.array(edges, dtype=float)
+    except Exception:
+        return None
+    return None
 
-    def _grid(ax):
-        ax.grid(True, linewidth=0.6, alpha=0.35, zorder=0)
 
-    # RMSE barplot
-    df_bar = df.sort_values("rmse_mean").reset_index(drop=True)
-    fig, ax = plt.subplots(figsize=(max(7, 0.8 * len(df_bar)), 5))
-    x = np.arange(len(df_bar))
-    ax.bar(x, df_bar["rmse_mean"], yerr=df_bar["rmse_std"], alpha=0.95, zorder=2)
-    ax.set_xticks(x, df_bar["variant"], rotation=45, ha="right")
-    ax.set_ylabel("RMSE (mean ± std)")
-    ax.set_title("Ablation — RMSE by variant")
-    _grid(ax)
-    bidx = _baseline_index(df_bar)
-    if bidx is not None:
-        ax.bar(bidx, df_bar.loc[bidx, "rmse_mean"], yerr=df_bar.loc[bidx, "rmse_std"],
-               color="tab:orange", alpha=0.95, zorder=3)
-    _safe_savefig(fig, plots_dir / "rmse_bar.png")
+def _format_edges(edges: np.ndarray) -> list[str]:
+    """Format bin labels from integer edges."""
+    L = edges.astype(int).tolist()
+    labels: list[str] = []
+    for i in range(len(L)):
+        if i == len(L) - 1:
+            labels.append(f"{L[i]}+")
+        elif i == 0:
+            labels.append(f"1-{L[i + 1] - 1}")
+        else:
+            upper = L[i + 1] - 1
+            if upper < L[i]:
+                upper = L[i] 
+            if upper == L[i]:
+                labels.append(f"{L[i]}")
+            else:
+                labels.append(f"{L[i]}-{upper}")
+    return labels
 
-    # Time barplot
-    df_time = df_bar
-    fig, ax = plt.subplots(figsize=(max(7, 0.8 * len(df_time)), 5))
-    ax.bar(
-        x, df_time["time_mean"], yerr=df_time["time_std"], alpha=0.95, zorder=2
-        )
-    ax.set_xticks(x, df_time["variant"], rotation=45, ha="right")
-    ax.set_ylabel("Time (s) mean ± std")
-    ax.set_title("Ablation — Training time by variant")
-    _grid(ax)
-    if bidx is not None:
+
+def _variant_offsets(n_bins: int, n_variants: int) -> tuple[np.ndarray, float]:
+    """Compute x offsets and bar width for grouped bar charts."""
+    base_x = np.arange(n_bins)
+    width = min(0.85 / max(n_variants, 1), 0.18)
+    return base_x, width
+
+
+def _upper_bound_for_bins(means: np.ndarray, stds: np.ndarray) -> Optional[float]:
+    """Compute upper bound for y-axis."""
+    if means is None or stds is None:
+        return None
+    max_vals = means + stds
+    upper_bound = float(np.nanmax(max_vals)) + 0.02
+    return upper_bound
+
+
+def _lower_bound_for_bins(means: np.ndarray, stds: np.ndarray) -> Optional[float]:
+    """Compute lower bound for y-axis to capture 10% from max."""
+    if means is None or stds is None:
+        return None
+    min_val = np.nanmin(means - stds)
+    max_val = np.nanmax(means + stds)
+    lower_bound = min(
+        0.9 * max_val - 0.02,
+        min_val - 0.02
+    )
+    return lower_bound
+
+
+def _grid_steps(min: float, max: float, percent: float) -> float:
+    """Calculate grid steps for percentage-based y-axis."""
+    span = max - min
+    step = span * percent
+    return step
+
+
+def _plot_bins_grouped(df: pd.DataFrame, out_dir: Path) -> None:
+    """
+    Create a grouped bar chart of per-popularity-bin RMSE with error bars.
+
+    Args:
+        df: Ablation results DataFrame.
+        out_dir: Output directory where plots/ subdir is located.
+
+    Produces:
+        plots/bins_grouped_bars.png
+    """
+    plots_dir = _plots_dir(out_dir)
+
+    bin_means = _bin_mean_cols(df)
+    if not bin_means:
+        return
+    bin_stds = _bin_std_cols(bin_means)
+    missing = [c for c in bin_stds if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing std columns in ablations.csv: {missing}")
+
+    # Tick labels from edges if available
+    edges = _read_bin_edges(out_dir, len(bin_means))
+    xticklabels = (
+        _format_edges(edges)
+    )
+
+    df_ord = _order_by_overall_rmse(df)
+    V, B = len(df_ord), len(bin_means)
+    base_x, width = _variant_offsets(B, V)
+
+    # Compute y-axis upper bound
+    all_means = df_ord[bin_means].to_numpy(dtype=float)
+    all_stds  = df_ord[bin_stds].to_numpy(dtype=float)
+    upper_bound = _upper_bound_for_bins(
+        np.nanmax(all_means, axis=0),
+        np.nanmax(all_stds, axis=0)
+    )
+    lower_bound = _lower_bound_for_bins(
+        np.nanmin(all_means, axis=0),
+        np.nanmin(all_stds, axis=0)
+    )
+
+    fig, ax = plt.subplots(figsize=(max(9, 0.7 * B * max(V, 1) / 3), 5))
+
+    for i, (_, row) in enumerate(df_ord.iterrows()):
+        offsets = base_x + (i - (V - 1) / 2) * width
+        heights = [float(row[c]) for c in bin_means]
+        yerr = [float(row[c]) for c in bin_stds]
         ax.bar(
-            bidx, df_time.loc[bidx, "time_mean"],
-            yerr=df_time.loc[bidx, "time_std"],
-            color="tab:orange",
-            alpha=0.95,
-            zorder=3
-            )
-    _safe_savefig(fig, plots_dir / "time_bar.png")
+            offsets,
+            heights,
+            width=width,
+            yerr=yerr,
+            capsize=3,
+            label=str(row["variant"]),
+            alpha=0.9,
+            zorder=2,
+            linewidth=0,
+        )
 
-    # RMSE vs Time scatter
-    fig, ax = plt.subplots(figsize=(7, 5))
-    ax.errorbar(df["time_mean"], df["rmse_mean"],
-                xerr=df["time_std"], yerr=df["rmse_std"],
-                fmt="o", alpha=0.95, zorder=2)
-    ax.set_xlabel("Time (s) mean ± std")
-    ax.set_ylabel("RMSE mean ± std")
-    ax.set_title("Ablation — RMSE vs Time")
+    ax.set_xticks(base_x, xticklabels)
+    ax.set_ylabel("Test RMSE")
+    ax.set_title("Ablation — Test RMSE per popularity bin")
+    step = _grid_steps(lower_bound, upper_bound, 0.1)
+    ax.set_yticks(np.arange(lower_bound, upper_bound, step))
+    ax.set_ylim(lower_bound, upper_bound)
     _grid(ax)
-    for _, r in df.sort_values("rmse_mean", ascending=False).iterrows():
+    ax.legend(loc="upper right", frameon=False)
+    fig.tight_layout()
+    _safe_savefig(fig, plots_dir / "bins_grouped_bars.png")
+
+
+def _bar_with_baseline(
+    means: np.ndarray,
+    stds: np.ndarray,
+    labels: list[str],
+    title: str,
+    ylabel: str,
+    highlight_idx: Optional[int],
+    save_path: Path,
+) -> None:
+    """
+    Create a bar chart with error bars, highlighting a specific bar.
+    
+    Args:
+        means: Array of mean values for each bar.
+        stds: Array of standard deviation values for each bar.
+        labels: List of labels for each bar.
+        title: Title of the plot.
+        ylabel: Label for the y-axis.
+        highlight_idx: Index of the bar to highlight (e.g., baseline), or None.
+        save_path: Path to save the resulting PNG plot.
+    """
+    fig, ax = _figure_for_n(len(labels))
+    x = np.arange(len(labels))
+    upper_bound = _upper_bound_for_bins(
+        np.nanmax(means), np.nanmax(stds)
+    )
+    lower_bound = _lower_bound_for_bins(
+        np.nanmin(means), np.nanmin(stds)
+    )
+    ax.bar(x, means, yerr=stds, color="steelblue", alpha=0.95, zorder=2)
+    if highlight_idx is not None:
+        ax.bar(
+            highlight_idx,
+            means[highlight_idx],
+            yerr=stds[highlight_idx],
+            color="royalblue",
+            alpha=0.95,
+            zorder=3,
+        )
+    ax.set_xticks(x, labels, rotation=45, ha="right")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    step = _grid_steps(lower_bound, upper_bound, 0.1)
+    ax.set_yticks(np.arange(lower_bound, upper_bound, step))
+    ax.set_ylim(lower_bound, upper_bound)
+    _grid(ax)
+    fig.tight_layout()
+    _safe_savefig(fig, save_path)
+
+
+def _scatter_with_error(
+    x_mean: np.ndarray,
+    y_mean: np.ndarray,
+    x_std: np.ndarray,
+    y_std: np.ndarray,
+    labels: list[str],
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    save_path: Path,
+) -> None:
+    """
+    Create a scatter plot with error bars and point annotations.
+    
+    Args:
+        x_mean: Array of x-axis mean values.
+        y_mean: Array of y-axis mean values.
+        x_std: Array of x-axis standard deviation values.
+        y_std: Array of y-axis standard deviation values.
+        labels: List of labels for each point.
+        title: Title of the plot.
+        xlabel: Label for the x-axis.
+        ylabel: Label for the y-axis.
+        save_path: Path to save the resulting PNG plot.
+    """
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.errorbar(
+        x_mean, y_mean, xerr=x_std, yerr=y_std, fmt="o", alpha=0.95, zorder=2
+        )
+    for lx, ly, name in zip(x_mean, y_mean, labels):
         ax.annotate(
-            r["variant"],
-            (r["time_mean"], r["rmse_mean"]),
-            xytext=(5, 3),
+            name,
+            (lx, ly),
+            xytext=(5, 3), 
             textcoords="offset points",
             fontsize=8
             )
-    _safe_savefig(fig, plots_dir / "rmse_vs_time.png")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    _grid(ax)
+    fig.tight_layout()
+    _safe_savefig(fig, save_path)
 
-    # Popularity-bin comparisons
-    bin_cols = [c for c in df.columns if c.startswith("rmse_pop_")]
-    if bin_cols:
-        df_top = df.sort_values("rmse_mean").reset_index(drop=True)
-        V = len(df_top)
-        B = len(bin_cols)
-        width = max(0.75 / B, 0.08)
 
-        fig, ax = plt.subplots(figsize=(max(8, 0.7 * B * V / 3), 5))
-        base_x = np.arange(B)
-        for i, (_, row) in enumerate(df_top.iterrows()):
-            offsets = base_x + (i - (V - 1) / 2) * width
-            heights = [row[c] for c in bin_cols]
-            ax.bar(
-                offsets,
-                heights,
-                width=width,
-                label=row["variant"],
-                alpha=0.9,
-                zorder=2
-                )
+def _save_comparative_plots(df: pd.DataFrame, out_dir: Path) -> None:
+    """
+    Create comparative PNG plots from the ablation summary DataFrame.
 
-        ax.set_xticks(
-            base_x,
-            [c.replace("rmse_pop_", "Bin ") for c in bin_cols]
-            )
-        ax.set_ylabel("RMSE (per popularity bin)")
-        ax.set_title("Ablation — RMSE per popularity bin")
-        _grid(ax)
-        _safe_savefig(fig, plots_dir / "bins_grouped_bars.png")
+    Args:
+        df: Ablation results DataFrame.
+        out_dir: Output directory where plots/ subdir is located.
 
-    # Heatmap: per-bin ΔRMSE vs baseline
-    if "full" in df["variant"].values and bin_cols:
-        baseline_bins = df.loc[df["variant"] == "full", bin_cols].iloc[0]
-        mat, labels = [], []
-        for _, r in df.iterrows():
-            deltas = [
-                (r[c] - baseline_bins[c]) if np.isfinite(r[c]) else np.nan
-                for c in bin_cols
-            ]
-            mat.append(deltas); labels.append(r["variant"])
-        mat = np.array(mat, dtype=float)
+    Produces:
+        rmse_bar.png              (RMSE mean ± std by variant)
+        time_bar.png              (time mean ± std by variant)
+        rmse_vs_time.png          (scatter with error bars)
+        bins_grouped_bars.png     (per-popularity-bin RMSE with error bars)
+    """
+    plots_dir = _plots_dir(out_dir)
+    df_ord = _order_by_overall_rmse(df)
 
-        fig, ax = plt.subplots(
-            figsize=(1.2 * len(bin_cols) + 2, 0.45 * len(labels) + 2)
-            )
-        im = ax.imshow(
-            mat,
-            aspect="auto",
-            interpolation="nearest",
-            cmap="RdBu_r",
-            zorder=2
-            )
-        ax.set_xticks(
-            np.arange(len(bin_cols)),
-            [c.replace("rmse_pop_", "Bin ") for c in bin_cols],
-            rotation=45,
-            ha="right"
-            )
-        ax.set_yticks(np.arange(len(labels)), labels)
-        ax.set_title("Δ RMSE vs baseline (per popularity bin)")
-        vmax = np.nanmax(np.abs(mat))
-        if np.isfinite(vmax) and vmax > 0:
-            im.set_clim(-vmax, vmax)
-        fig.colorbar(im, ax=ax, shrink=0.8)
-        _safe_savefig(fig, plots_dir / "bins_heatmap.png")
+    # RMSE barplot
+    rmse_means = df_ord["rmse_mean"].to_numpy(dtype=float)
+    rmse_stds  = df_ord["rmse_std"].to_numpy(dtype=float)
+    labels     = df_ord["variant"].astype(str).tolist()
+    _bar_with_baseline(
+        rmse_means, rmse_stds, labels,
+        title="Ablation — Test RMSE by model variant",
+        ylabel="Test RMSE",
+        highlight_idx=_baseline_index(df_ord),
+        save_path=plots_dir / "rmse_bar.png",
+    )
+
+    # Time barplot
+    time_means = df_ord["time_mean"].to_numpy(dtype=float)
+    time_stds  = df_ord["time_std"].to_numpy(dtype=float)
+    _bar_with_baseline(
+        time_means, time_stds, labels,
+        title="Ablation — Training time by model variant",
+        ylabel="Time (s)",
+        highlight_idx=_baseline_index(df_ord),
+        save_path=plots_dir / "time_bar.png",
+    )
+
+    # RMSE vs Time scatterplot
+    _scatter_with_error(
+        x_mean=time_means,
+        y_mean=rmse_means,
+        x_std=time_stds,
+        y_std=rmse_stds,
+        labels=labels,
+        title="Ablation — RMSE vs Time",
+        xlabel="Time (s)",
+        ylabel="Test RMSE",
+        save_path=plots_dir / "rmse_vs_time.png",
+    )
+
+    # Popularity bins
+    _plot_bins_grouped(df, out_dir)
 
 
 def _save_convergence_artifacts(
@@ -655,7 +910,7 @@ def _save_convergence_artifacts(
             )
 
     ax.set_xlabel("ALS iteration")
-    ax.set_ylabel("Train RMSE (mean ± std over folds)")
+    ax.set_ylabel("Train RMSE")
     ax.set_title("Convergence of ablations")
     ax.legend(loc="best", frameon=False)
     ax.grid(True, linewidth=0.4, alpha=0.4)
@@ -663,14 +918,12 @@ def _save_convergence_artifacts(
 
 
 def _row_to_dict(
-    r: AblationResultRow,
-    feature_names: List[str]
+    r: AblationResultRow
 ) -> Dict[str, Any]:
     """Convert AblationResultRow to a flat dict for CSV/JSON.
 
     Args:
         r: AblationResultRow instance.
-        feature_names: List of item feature names.
 
     Returns:
         Flat dict representation.
@@ -681,6 +934,8 @@ def _row_to_dict(
         "rmse_std": r.rmse_std,
         "time_mean": r.time_mean,
         "time_std": r.time_std,
+        "rmse_train_mean": r.rmse_train_mean,
+        "rmse_train_std": r.rmse_train_std,
         "mean_iters": r.mean_iters,
         "early_stopped_folds": r.early_stopped_folds,
         "target_n_iters": r.target_n_iters,
@@ -691,16 +946,8 @@ def _row_to_dict(
         "delta_mean": r.delta_mean,
     }
     # Per-bin RMSEs
-    d.update(sorted(r.rmse_bins.items()))
-    # Common hyperparameters for traceability
-    for k in ("alpha", "graph_feature", "pop_reg_mode",
-              "n_factors", "n_iters", "lambda_u", "lambda_v",
-              "lambda_bu", "lambda_bi", "update_w_every"):
-        if k in r.params:
-            d[f"param_{k}"] = r.params[k]
-    # λ_w_* for all features
-    for f in feature_names:
-        d[f"param_lambda_w_{f}"] = r.params.get(f"lambda_w_{f}")
+    d.update(sorted(r.rmse_bins_mean.items()))
+    d.update(sorted(r.rmse_bins_std.items()))
 
     return d
 
@@ -727,7 +974,7 @@ def run_ablation(
         n_pop_bins: Number of popularity bins.
         es_tol: Early-stopping tolerance (overrides tuning default if set).
         es_min_iters: Minimum iterations before early stopping
-                      (overrides tuning default if set).
+                    (overrides tuning default if set).
         verbose_fit: Verbosity level for ALS fitting.
 
     Returns:
@@ -768,8 +1015,14 @@ def run_ablation(
     fold_scores: Dict[str, List[float]] = {}
     curves: Dict[str, List[List[float]]] = {}
 
-    for name, params in variants:
-        fold_rmse, fold_time, fold_bin_rmse, fold_iters = _eval_variant_cv(
+    for name, params in tqdm(variants, desc="Ablation variants"):
+        (
+            fold_rmse,
+            fold_time,
+            fold_bin_rmse,
+            fold_iters,
+            fold_train_rmse
+        ) = _eval_variant_cv(
             variant_name=name,
             R=R,
             features=features,
@@ -783,6 +1036,9 @@ def run_ablation(
             verbose_fit=verbose_fit,
         )
         fold_scores[name] = list(fold_rmse)
+
+        # Aggregate bins mean/std
+        bins_mean, bins_std = _aggregate_bins_stats(fold_bin_rmse)
 
         target_n_iters = int(params.get("n_iters", 0))
         rows.append(AblationResultRow(
@@ -802,7 +1058,11 @@ def run_ablation(
             target_n_iters=target_n_iters,
             es_tol=es_tol,
             es_min_iters=es_min_iters,
-            rmse_bins=_aggregate_bins_mean(fold_bin_rmse),
+            rmse_bins_mean=bins_mean,
+            rmse_bins_std=bins_std,
+            rmse_train_mean=float(np.mean(fold_train_rmse)),
+            rmse_train_std=(float(np.std(fold_train_rmse, ddof=1))
+                            if len(fold_train_rmse) > 1 else 0.0),
             params=params,
         ))
 
@@ -829,7 +1089,7 @@ def run_ablation(
 
     # Write CSV
     csv_path = out_base / "ablations.csv"
-    df = pd.DataFrame([_row_to_dict(r, feature_names) for r in rows])
+    df = pd.DataFrame([_row_to_dict(r) for r in rows])
     df.to_csv(csv_path.as_posix(), index=False)
 
     # Write JSON (metadata + results)
@@ -840,16 +1100,16 @@ def run_ablation(
         "folds_seed": int(saved_seed),
         "feature_names": feature_names,
         "n_pop_bins": int(n_pop_bins),
-        "pop_bin_edges": [float(e) for e in edges],
+        "pop_bin_edges": [int(e) for e in edges],
         "es_tol": es_tol,
         "es_min_iters": es_min_iters,
         "variants_evaluated": [r.variant for r in rows],
         "best_params_used": best_params,
-        "results": [ _row_to_dict(r, feature_names) for r in rows ],
+        "results": [_row_to_dict(r) for r in rows],
     }
     Path(json_path).write_text(json.dumps(payload, indent=2))
 
-    # Plots (comparative + convergence)
+    # Plots
     try:
         _save_comparative_plots(df, out_base)
     except Exception:
@@ -860,3 +1120,99 @@ def run_ablation(
         pass
 
     return csv_path, json_path
+
+
+def _parse_params() -> argparse.Namespace:
+    """Parse command-line parameters for ablation study."""
+
+    parser = argparse.ArgumentParser(
+        description="Run ablation study on ALS with side features."
+    )
+    parser.add_argument(
+        "--R_path",
+        type=str,
+        required=True,
+        help="Path to ratings matrix .npy file."
+    )
+    parser.add_argument(
+        "--folds_path",
+        type=str,
+        required=True,
+        help="Path to frozen folds .npz file."
+    )
+    parser.add_argument(
+        "--best_params_path",
+        type=str,
+        required=True,
+        help="Path to best params JSON file."
+    )
+    parser.add_argument(
+        "--features_path",
+        type=str,
+        required=True,
+        help="Path to item features .npy file."
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default="results",
+        help="Output directory to save ablation results (default: results)."
+    )
+    parser.add_argument(
+        "--n_pop_bins",
+        type=int,
+        default=N_POP_BINS,
+        help=f"Number of popularity bins (default: {N_POP_BINS})."
+    )
+    parser.add_argument(
+        "--es_tol",
+        type=float,
+        default=None,
+        help="Early-stopping tolerance (set to None to disable)."
+    )
+    parser.add_argument(
+        "--es_min_iters",
+        type=int,
+        default=None,
+        help="Minimum iterations before early stopping (set to None to disable)."
+    )
+    parser.add_argument(
+        "--verbose_fit",
+        type=int,
+        default=0,
+        help="Verbosity level for ALS fitting (default: 0)."
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    """Main function to run ablation study from command line."""
+
+    # Parse arguments
+    args = _parse_params()
+
+    # Load features
+    features = np.load(args.features_path)
+    features = {key: features[key] for key in features.files}
+    
+    logger.info(f"Started ablation study")
+
+    # Run ablation study
+    csv_p, json_p = run_ablation(
+        R_path=args.R_path,
+        folds_path=args.folds_path,
+        best_params_path=args.best_params_path,
+        features=features,
+        out_dir="results",
+        n_pop_bins=args.n_pop_bins,
+        es_tol=args.es_tol,
+        es_min_iters=args.es_min_iters,
+        verbose_fit=args.verbose_fit
+    )
+
+    logger.info(f"Saved ablation results to CSV: {csv_p} and JSON: {json_p}")
+
+
+if __name__ == "__main__":
+    main()

@@ -300,7 +300,7 @@ class ALS:
     def fit(self,
             R: np.ndarray,
             features: dict[str, np.ndarray] | None = None,
-            tol: float = 1e-3,
+            tol: float = 1e-4,
             min_iters: int = 5,
             verbose: int = 1
             ) -> ALS:

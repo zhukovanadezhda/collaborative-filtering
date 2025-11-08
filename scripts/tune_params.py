@@ -60,11 +60,14 @@ print("Best value:", res.best_value)
 print("Best params JSON:", res.best_params_json_path)
 print("Trials CSV:", res.trials_csv_path)
 print("Plots dir:", res.plots_dir)
+```
 """
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
+import logging
 from typing import Dict, Any, List, Optional
 from itertools import combinations
 from pathlib import Path
@@ -80,7 +83,7 @@ from optuna.visualization import (
     plot_param_importances,
     plot_slice,
     plot_parallel_coordinate,
-    plot_contour,
+    plot_contour
 )
 
 from scripts.als import ALS
@@ -92,7 +95,6 @@ from scripts.als_config import (
     GraphSimConfig,
 )
 from scripts.create_folds import load_folds_npz, make_train_valid_split
-
 
 # Search space bounds
 N_FACTORS_MIN: int = 1
@@ -119,6 +121,17 @@ MAX_CONTOUR_PAIRS: int = 6
 
 # Misc
 DEFAULT_RANDOM_STATE: int = 42
+
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+)
+logger = logging.getLogger(__name__)
+optuna.logging.disable_default_handler()
+optuna.logging.enable_propagation()
+logging.getLogger("optuna").setLevel(logging.INFO)
 
 
 @dataclass
@@ -649,7 +662,7 @@ def run_tuning(
         study_name=study_name,
         direction="minimize",
         sampler=sampler,
-        pruner=pruner,
+        pruner=pruner
     )
 
     feature_names = list(features.keys())
@@ -739,3 +752,92 @@ def run_tuning(
         best_params_json_path = best_params_json_path,
         plots_dir             = plots_dir.as_posix(),
     )
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Tune ALS hyperparameters with Optuna on frozen CV folds."
+    )
+    parser.add_argument(
+        "--R_path",
+        type=str,
+        required=True,
+        help="Path to the ratings matrix (.npy)."
+    )
+    parser.add_argument(
+        "--folds_path",
+        type=str,
+        required=True,
+        help="Path to the folds (.npz)."
+    )
+    parser.add_argument(
+        "--features_path",
+        type=str,
+        required=True,
+        help="JSON dictionary mapping feature names to feature matrices."
+    )
+    parser.add_argument(
+        "--study_name",
+        type=str,
+        default="als_tuning",
+        help="Name of the Optuna study."
+    )
+    parser.add_argument(
+        "--n_trials",
+        type=int,
+        default=50,
+        help="Number of trials to run."
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_RANDOM_STATE,
+        help="Random seed for reproducibility."
+    )
+    parser.add_argument(
+        "--save_every",
+        type=int,
+        default=25,
+        help="Save artifacts every N trials (0 to disable)."
+    )
+    parser.add_argument(
+        "--verbose_fit",
+        type=int,
+        default=0,
+        help="Verbosity level for fitting (0=silent)."
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    """Main function to run tuning from command-line."""
+
+    # Parse command-line arguments
+    args = _parse_args()
+
+    # Load features
+    features = np.load(args.features_path)
+    features = {key: features[key] for key in features.files}
+
+    logger.info(f"Started tuning parameters with Optuna for {args.n_trials} trials")
+
+    res = run_tuning(
+        R_path=args.R_path,
+        folds_path=args.folds_path,
+        features=features,
+        out_dir="results",
+        study_name=args.study_name,
+        n_trials=args.n_trials,
+        timeout_sec=None,
+        seed=args.seed,
+        save_every=args.save_every,
+        verbose_fit=args.verbose_fit
+    )
+
+    logger.info(f"Saved tuning results to {res.trials_csv_path} "
+                f"and plots in {res.plots_dir}. "
+                f"Best value: {res.best_value}, "
+                f"Best params JSON: {res.best_params_json_path}")
+
+if __name__ == "__main__":
+    main()

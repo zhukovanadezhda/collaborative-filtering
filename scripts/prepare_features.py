@@ -44,12 +44,22 @@ features = normalize_features_dict(
 
 from __future__ import annotations
 
-from typing import Dict, Any, Mapping, Literal
+import argparse
+import os
+import logging
+from typing import Dict, Any, Mapping
 import numpy as np
 
 # Global constants
 DEFAULT_DTYPE = "float32"
 DEFAULT_EPS = 1e-8
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
 def _as_2d(X: np.ndarray) -> np.ndarray:
@@ -228,6 +238,91 @@ def normalize_features_dict(
             eps=overrides.pop("eps", eps),
             dtype=overrides.pop("dtype", dtype),
             copy=overrides.pop("copy", copy),
-            **overrides,  # allow future-proof extra kwargs
+            **overrides
         )
     return out
+
+
+def _parse_args():
+    """Parse command-line arguments."""
+
+    parser = argparse.ArgumentParser(
+        description="Prepare and normalize item features."
+    )
+    parser.add_argument(
+        "--genres_path",
+        type=str,
+        required=True,
+        help="Path to raw genres feature (.npy)."
+    )
+    parser.add_argument(
+        "--years_path",
+        type=str,
+        required=True,
+        help="Path to raw years feature (.npy)."
+    )
+    parser.add_argument(
+        "--genres_norm_method",
+        type=str,
+        default="row_l1",
+        help="Normalization method for genres."
+    )
+    parser.add_argument(
+        "--genres_impute_method",
+        type=str,
+        default="none",
+        help="Imputation method for genres."
+    )
+    parser.add_argument(
+        "--years_norm_method",
+        type=str,
+        default="col_zscore",
+        help="Normalization method for years."
+    )
+    parser.add_argument(
+        "--years_impute_method",
+        type=str,
+        default="col_median",
+        help="Imputation method for years."
+    )
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        required=True,
+        help="Path to save normalized features (.json)."
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    """Main function to prepare features from command-line."""
+
+    # Parse command-line arguments
+    args = _parse_args()
+
+    # Load features
+    G = np.load(args.genres_path)
+    Y = np.load(args.years_path)
+
+    # Normalize features
+    G_norm = normalize_feature(
+        X=G,
+        method=args.genres_norm_method,
+        impute=args.genres_impute_method
+    )
+    Y_norm = normalize_feature(
+        X=Y,
+        method=args.years_norm_method,
+        impute=args.years_impute_method
+    )
+
+    # Save normalized features
+    os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
+    np.savez_compressed(args.output_path, genres=G_norm, years=Y_norm)
+
+    logger.info(f"Saved normalized features to {args.output_path}")
+
+
+if __name__ == "__main__":
+    main()
