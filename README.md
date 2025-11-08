@@ -1,10 +1,98 @@
 # Collaborative filtering for Recommendation Systems using Matrix Factorization
 
-Imagine building a **recommendation system that predicts what movies you might like based on your past ratings and those of similar users**. Intuitively, this involves filling in a large matrix where rows represent users, columns represent movies, and the entries are ratings. However, most of this matrix is empty because users only rate a small fraction of movies. So how do we predict those missing ratings knowing that we have very little data for many users and items?
+<details> <summary><h2>👉 TL;DR</h2> (click to expand)</summary>
+ 
+> This project explores how matrix factorization (MF), enhanced with side information, can improve movie recommendations from sparse rating data. We trained an MF model that learns latent user 👤 and item 🎬 representations being guided by metadata such as genres 🎞️ and release years 📅.
+> 
+> Our best configuration reached an RMSE of ≈ 0.86, and a structured hyperparameter tuning followed by an ablation study revealed that:
+> 
+> - 👍 Removing side features degrades performance (+0.22 RMSE), confirming that metadata encode structure the latent factors alone cannot capture.
+> - 👍 Genre and year features are complementary, each adding small but consistent gains.
+> - 👎 Graph regularization and popularity-aware shrinkage show negligible impact in this setup.
+> 
+> While none of these effects reach statistical significance (given the limited folds), the findings suggest that simple, well-regularized models can remain interpretable, stable, and competitive.
+> Beyond accuracy, the focus is on building a clean, reproducible workflow designed to serve as a solid baseline for future recommender projects.
+
+</details>
+
+
+<details> <summary><h2>👉 Run the code</h2> (click to expand)</summary>
+
+### ⚙️ Overview
+
+This project follows a **four-stage pipeline**:
+
+1️⃣ **Create & freeze folds** - build reproducible train/validation splits  
+2️⃣ **Prepare & normalize features** - process metadata such as genres or years  
+3️⃣ **Tune hyperparameters** - run Optuna to find the best configuration  
+4️⃣ **Evaluate & ablate** - benchmark and interpret model variants  
+
+To reproduce everything end-to-end, simply run:
+
+```bash
+bash scripts/run_all.sh
+```
+This script executes all four stages in sequence, reproducing the full experiment with the default configuration.
+
+### ⚙️ Run stages separately
+
+Each module can also be executed independently with your own parameters:
+
+**1. Create folds**
+
+```bash
+python -m scripts.create_folds \
+  --input data/ratings.npy \
+  --output artifacts/folds/entrywise_folds_seed_<SEED>.npz \
+  --n_splits <K> \
+  --seed <SEED>
+```
+
+**2. Prepare features**
+
+```bash
+python -m scripts.prepare_features \
+  --genres_path data/genres.npy \
+  --years_path data/years.npy \
+  --genres_norm_method <row_l1|col_zscore|none> \
+  --years_norm_method <row_l1|col_zscore|none> \
+  --output_path data/features.npz
+```
+
+**3. Tune hyperparameters**
+
+```bash
+python -m scripts.tune_params \
+  --R_path data/ratings.npy \
+  --folds_path artifacts/folds/entrywise_folds_seed_<SEED>.npz \
+  --features_path data/features.npz \
+  --study_name <study_name> \
+  --n_trials <N> \
+  --seed <SEED>
+```
+
+**4. Evaluate or ablate models**
+
+```bash
+python -m scripts.evaluate_models \
+  --R_path data/ratings.npy \
+  --folds_path artifacts/folds/entrywise_folds_seed_<SEED>.npz \
+  --best_params_path results/tuning/<study_name>_best_params.json \
+  --features_path data/features.npz \
+  --out_dir results/ablations \
+  --n_pop_bins <N_BINS>
+```
+Each of the corresponding scripts is (hopefully) well-documented, so feel free to check their internal docstrings and comments in case of any question or if you’d like to adapt them to your own setup.
+
+</details>
+
+## 1. Introduction
+
+Imagine building a **recommendation system that predicts what movies you might like based on your past ratings and those of similar users**. Intuitively, this involves filling in a large matrix where rows represent users, columns represent movies, and the entries are ratings. However, most of this matrix is empty because users only rate a small fraction of movies. So, how do we predict those missing ratings knowing that we have very little data for many users and items?
 
 This is a classic problem in data science known as **collaborative filtering**. It looks for patterns in user behavior and item characteristics to infer preferences, even when direct ratings are sparse. This repository contains a project that implements this kind of model using **matrix factorization techniques**, to predict user-item ratings in a sparse matrix.
 
-## 1. Problem Statement
+## 2. Problem Statement
 
 We aim to predict unobserved user–item ratings in a sparse matrix $R \in \mathbb{R}^{m \times n}$, where each entry $R_{ui}$ is the rating given by user $u$ to item $i$.
 Only a small subset of entries ($\Omega \subset [m] \times [n]$) is observed, making the task one of **matrix completion under sparsity**.
@@ -23,7 +111,7 @@ $$
 $$
 
 
-## 2. Our solution
+## 3. Our solution
 
 Our final model represents the predicted rating $\widehat{R}_{ui}$ with several low-rank matrices $U, V, W_f$ learned from data, where $U$ and $V$ capture latent user and item factors, and $W_f$ project item features into the latent space. We further extend this approach by adding bias terms.
 
@@ -49,7 +137,7 @@ where:
 
 
 <details markdown="1"> 
-  <summary>📘 Details of different regularization terms used in the loss function (click to expand)</summary>
+  <summary><h3>👉 Details of different regularization terms used in the loss function</h3> (click to expand)</summary>
 
 The loss minimized over observed ratings is enriched with several regularization terms to incorporate side information. Some of these regularizations are optional and can be deactivated, but the most complete formula of the loss function is:
 
@@ -82,7 +170,7 @@ In simple terms:
 The updates repeat for a fixed number of iterations, but an early-stopping mechanism is applied to halt training once the validation RMSE stops improving, avoiding overfitting and saving computation.
 
 <details markdown="1"> 
-  <summary>🧮 Detailed update equations (click to expand)</summary>
+  <summary><h3>👉 Detailed update equations</h3> (click to expand)</summary>
 
 At each iteration, we update each parameter in turn by solving the following subproblems (with Cholesky decomposition for efficiency):
 
@@ -103,7 +191,7 @@ Each term above corresponds to solving a small, independent least-squares proble
 </details> 
 
 
-## 3. Hyperparameter Tuning
+## 4. Hyperparameter Tuning
 
 From our solution above, we can see that there are several hyperparameters to tune. So, once the model was implemented, we performed a hyperparameter search using Optuna with 3-fold cross-validation on the frozen folds that we created from the dataset. Each trial minimizes the mean validation RMSE across folds. We used a TPE sampler and MedianPruner, with early stopping enabled inside ALS (`es_tol = 1e−4`, `es_min_iters = 10`). The optimization ran for 150 trials.
 
@@ -116,7 +204,7 @@ From our solution above, we can see that there are several hyperparameters to tu
 > The best model combined feature-based item embeddings, graph regularization, and popularity-aware item shrinkage, suggesting that integrating side information improves generalization.
 
 <details> 
-  <summary>⚙️ The details on the hyperparameters and the used search space (click to expand)</summary>
+  <summary><h3>👉 Details on the hyperparameters and the used search space</h3> (click to expand)</summary>
 
 | Hyperparameter           | Description                                    | Search Space               |
 | ------------------------ | ---------------------------------------------- | -------------------------- |
@@ -152,7 +240,7 @@ Since the best model combined all available components, to better understand the
 *Table 2. Description of model variants tested in the ablation study and their altered components.*
 
 
-<details> <summary>📊 Full results table (click to expand)</summary>
+<details> <summary><h3>👉 Full results table</h3> (click to expand)</summary>
 
 | Variant               | Time |Train RMSE| Test RMSE | Cold Bin RMSE | Popular Bin RMSE | Raw p-value | FDR Corrected p-value |
 | --------------------- | ---- | -|-------- | -------------- | ----------------- | ------- | --------------------- |
@@ -168,7 +256,7 @@ Since the best model combined all available components, to better understand the
 
 </details>
 
-## 5. Results and Discussion
+## 6. Results and Discussion
 
 The most visible effect appears when side features are removed: without genres and years, the test RMSE increases by about +0.22 (Fig.1 (a)), which suggests that these **metadata capture structure that the latent factors alone fail to model**. Using a single feature weakens performance: `only_genres` stays close, `only_years` drops more, meaning that **the two features look complementary rather than interchangeable**. Disabling the graph term (`no_graph`) or switching its similarity source (`graph_feature=years`) produces almost no change in RMSE, but consistently shortens training (Fig.1 (b)), because the construction of the similarity graph takes time with no visible impact on the final performance. The removing popularity-aware shrinkage (`no_pop_reg`) does not affect RMSE much either, though the idea of popularity-awareness could be further explored (here we only tested uniform vs. inverse-sqrt scaling).
 
@@ -185,7 +273,7 @@ However, even this small effect does not pass the significance threshold ($\alph
   <em>Fig. 1: (a) Test RMSE by variant; (b) Training time by variant; (c) Test RMSE per item-popularity bin (mean ± std across folds).</em>
 </p>
 
-## 6. Conclusion
+## 7. Conclusion
 
 This project implemented a recommender system based on matrix factorization, extended with graph regularization, side-feature projections, and popularity-dependent item shrinkage. The results suggest that feature-based item embeddings contribute most to predictive quality, while graph and popularity terms primarily help with stability and calibration.
 
